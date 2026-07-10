@@ -167,6 +167,13 @@ Open a small skeleton preview window:
 py -3.10 preview.py
 ```
 
+If a preview has not been generated yet, this command builds it first. Preview
+generation defaults to `--device auto`, which prefers CUDA when available and
+falls back to CPU. On CPU, the preview command limits compute threads to `4` by
+default so opening a preview does not take over the whole machine. Use
+`--cpu-threads 2` for a lighter preview build, or `--device cuda:0` to force a
+GPU.
+
 The preview window auto-plays the next video when one clip ends. It also has a
 `Next` button. You can press `n` for next, `p` for previous, and `q` or `Esc`
 to quit. Add `--loop-current` if you want one clip to replay instead.

@@ -42,7 +42,15 @@ def preview_is_ready(path):
     return path.exists() and path.stat().st_size > 1024
 
 
-def ensure_visualization(video, out_dir, vis_dir, regenerate=False, device="cpu"):
+def ensure_visualization(
+    video,
+    out_dir,
+    vis_dir,
+    regenerate=False,
+    device="auto",
+    cpu_threads=4,
+    pose_batch_size=1,
+):
     vis_video, vis_image = visualization_paths(video, vis_dir)
     if preview_is_ready(vis_video) and not regenerate:
         print("preview ready: {}".format(vis_video), flush=True)
@@ -66,6 +74,9 @@ def ensure_visualization(video, out_dir, vis_dir, regenerate=False, device="cpu"
         visualize_dir=str(vis_dir),
         skip_existing=False,
         limit=None,
+        cpu_threads=cpu_threads,
+        pose_batch_size=pose_batch_size,
+        workers=1,
     ))
     return vis_video, vis_image
 
@@ -135,6 +146,8 @@ class PreviewBuildJob:
                 vis_dir=self.args.vis_dir,
                 regenerate=self.args.regenerate,
                 device=self.args.device,
+                cpu_threads=self.args.cpu_threads,
+                pose_batch_size=self.args.pose_batch_size,
             )
         except Exception as exc:
             self.error = exc
@@ -283,7 +296,9 @@ def parser():
     p.add_argument("--video", help="Specific NTU *_rgb.avi file. Defaults to the first extracted video.")
     p.add_argument("--vis-dir", default=str(DEFAULT_VIS_DIR))
     p.add_argument("--out-dir", default=str(SKELETON_DIR))
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto", help="Device for preview generation. Default auto prefers cuda:0, then cpu.")
+    p.add_argument("--cpu-threads", type=int, default=4, help="Limit CPU threads while generating a missing preview.")
+    p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size while generating a missing preview.")
     p.add_argument("--regenerate", action="store_true")
     p.add_argument("--no-window", action="store_true", help="Only generate/check files, do not open OpenCV window.")
     p.add_argument("--speed", type=float, default=1.0)
@@ -314,6 +329,8 @@ def main():
             vis_dir=args.vis_dir,
             regenerate=args.regenerate,
             device=args.device,
+            cpu_threads=args.cpu_threads,
+            pose_batch_size=args.pose_batch_size,
         )
         print("preview video: {}".format(vis_video.resolve()), flush=True)
         print("preview image: {}".format(vis_image.resolve()), flush=True)
