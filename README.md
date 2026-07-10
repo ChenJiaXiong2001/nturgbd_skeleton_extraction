@@ -165,24 +165,27 @@ Open a small skeleton preview window:
 
 ```powershell
 py -3.10 preview.py
-py -3.10 preview.py --direct
-py -3.10 preview.py --regenerate --temporal-min-frames 3 --temporal-min-keypoints 8
+py -3.10 preview.py --kpt-thr 0.35 --temporal-min-frames 4 --temporal-min-keypoints 10
+py -3.10 preview.py --no-direct
 ```
 
-If a preview has not been generated yet, this command builds it first. Preview
+By default, preview draws saved `.npz` skeletons directly on the original RGB
+video while playing, without generating a fused preview `.avi`. If a skeleton
+`.npz` has not been generated yet, this command builds it first. Preview
 generation defaults to `--device auto`, which prefers CUDA when available and
 falls back to CPU. On CPU, the preview command limits compute threads to `4` by
 default so opening a preview does not take over the whole machine. Use
 `--cpu-threads 2` for a lighter preview build, or `--device cuda:0` to force a
 GPU.
 
-The preview window auto-plays the next video when one clip ends. It also has a
-`Next` button. You can press `n` for next, `p` for previous, and `q` or `Esc`
-to quit. Add `--loop-current` if you want one clip to replay instead.
+The preview window auto-plays the next video when one clip ends. It also has
+`Prev` and `Next` buttons. You can press `n` for next, `p` for previous, and
+`q` or `Esc` to quit. Add `--loop-current` if you want one clip to replay
+instead.
 Use `--regenerate` after changing temporal cleanup settings, because existing
 preview `.avi` files already contain whatever skeletons were drawn earlier.
-Use `--direct` to skip generating a fused preview `.avi`; it draws the saved
-`.npz` skeletons directly on the original RGB video while playing.
+Use `--no-direct` only when you specifically want to generate and play a cached
+fused preview `.avi`.
 
 Open realtime RTMW skeletons from a local camera:
 

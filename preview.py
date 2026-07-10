@@ -184,6 +184,54 @@ def load_skeleton_arrays(path):
     }
 
 
+def filter_direct_points(frame, keypoints, scores, bboxes, bbox_scores, args):
+    import numpy as np
+
+    filtered_keypoints = keypoints.copy()
+    filtered_scores = scores.copy()
+    filtered_bboxes = bboxes.copy()
+    filtered_bbox_scores = bbox_scores.copy()
+    height, width = frame.shape[:2]
+    for person_idx, bbox in enumerate(filtered_bboxes):
+        if filtered_bbox_scores[person_idx] < args.direct_bbox_thr or np.isnan(bbox).any():
+            filtered_keypoints[person_idx] = np.nan
+            filtered_scores[person_idx] = 0
+            filtered_bboxes[person_idx] = np.nan
+            filtered_bbox_scores[person_idx] = 0
+            continue
+        x1, y1, x2, y2 = bbox.astype(float)
+        box_w = max(1.0, x2 - x1)
+        box_h = max(1.0, y2 - y1)
+        margin_x = box_w * args.direct_bbox_margin
+        margin_y = box_h * args.direct_bbox_margin
+        x1 -= margin_x
+        x2 += margin_x
+        y1 -= margin_y
+        y2 += margin_y
+        points = filtered_keypoints[person_idx]
+        valid = (
+            (filtered_scores[person_idx] >= args.kpt_thr)
+            & (points[:, 0] >= 0)
+            & (points[:, 0] < width)
+            & (points[:, 1] >= 0)
+            & (points[:, 1] < height)
+            & (points[:, 0] >= x1)
+            & (points[:, 0] <= x2)
+            & (points[:, 1] >= y1)
+            & (points[:, 1] <= y2)
+            & ~np.isnan(points[:, 0])
+            & ~np.isnan(points[:, 1])
+        )
+        filtered_keypoints[person_idx, ~valid] = np.nan
+        filtered_scores[person_idx, ~valid] = 0
+        if valid[:17].sum() < args.temporal_min_keypoints:
+            filtered_keypoints[person_idx] = np.nan
+            filtered_scores[person_idx] = 0
+            filtered_bboxes[person_idx] = np.nan
+            filtered_bbox_scores[person_idx] = 0
+    return filtered_keypoints, filtered_scores, filtered_bboxes, filtered_bbox_scores
+
+
 def resize_for_preview(frame, max_width, max_height):
     import cv2
 
@@ -200,21 +248,29 @@ def draw_controls(frame, label, index, total, auto_play=True):
 
     button_w, button_h = 112, 42
     margin = 14
-    x1 = frame.shape[1] - button_w - margin
+    gap = 10
+    next_x1 = frame.shape[1] - button_w - margin
     y1 = margin
-    x2 = frame.shape[1] - margin
+    next_x2 = frame.shape[1] - margin
     y2 = y1 + button_h
-    rect = (x1, y1, x2, y2)
+    prev_x1 = max(margin, next_x1 - button_w - gap)
+    prev_x2 = prev_x1 + button_w
+    prev_rect = (prev_x1, y1, prev_x2, y2)
+    next_rect = (next_x1, y1, next_x2, y2)
 
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 120, 30), -1)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 255, 80), 2)
-    cv2.putText(frame, "Next", (x1 + 23, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+    cv2.rectangle(frame, (prev_x1, y1), (prev_x2, y2), (90, 90, 90), -1)
+    cv2.rectangle(frame, (prev_x1, y1), (prev_x2, y2), (210, 210, 210), 2)
+    cv2.putText(frame, "Prev", (prev_x1 + 23, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+
+    cv2.rectangle(frame, (next_x1, y1), (next_x2, y2), (30, 120, 30), -1)
+    cv2.rectangle(frame, (next_x1, y1), (next_x2, y2), (80, 255, 80), 2)
+    cv2.putText(frame, "Next", (next_x1 + 23, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
 
     mode = "Auto Play" if auto_play else "Loop"
     info = "{}/{}  {}  [{}]".format(index + 1, total, label, mode)
     cv2.rectangle(frame, (10, frame.shape[0] - 38), (min(frame.shape[1] - 10, 760), frame.shape[0] - 8), (0, 0, 0), -1)
     cv2.putText(frame, info, (18, frame.shape[0] - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-    return rect
+    return prev_rect, next_rect
 
 
 def point_in_rect(x, y, rect):
@@ -225,7 +281,9 @@ def point_in_rect(x, y, rect):
 class PreviewState:
     def __init__(self):
         self.next_requested = False
-        self.button_rect = None
+        self.previous_requested = False
+        self.next_rect = None
+        self.previous_rect = None
 
 
 class PreviewBuildJob:
@@ -306,7 +364,8 @@ def wait_for_preview(video, args, cv2, window, state, last_frame):
 
     action = "building skeleton in background" if args.direct else "building preview in background"
     print("{}: {}".format(action, video), flush=True)
-    state.button_rect = None
+    state.next_rect = None
+    state.previous_rect = None
     job = PreviewBuildJob(video, args).start()
     while not job.done:
         frame = draw_loading(
@@ -330,6 +389,7 @@ def draw_direct_frame(frame, arrays, array_idx, args, display_filter, cv2):
     scores = arrays["scores"][array_idx]
     bboxes = arrays["bboxes"][array_idx]
     bbox_scores = arrays["bbox_scores"][array_idx]
+    keypoints, scores, bboxes, bbox_scores = filter_direct_points(frame, keypoints, scores, bboxes, bbox_scores, args)
     if args.direct_temporal_display:
         keypoints, scores, bboxes, bbox_scores = display_filter.apply_arrays(keypoints, scores, bboxes, bbox_scores)
     draw_skeleton(frame, keypoints, scores, bboxes, bbox_scores, args.kpt_thr, cv2)
@@ -359,7 +419,7 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
         array_idx = frame_to_array.get(frame_idx, frame_idx)
         frame = draw_direct_frame(frame, arrays, array_idx, args, display_filter, cv2)
         frame = resize_for_preview(frame, args.max_width, args.max_height)
-        state.button_rect = draw_controls(
+        state.previous_rect, state.next_rect = draw_controls(
             frame,
             Path(video).name,
             index,
@@ -375,6 +435,10 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
             cap.release()
             return "next"
         if key in (ord("p"), ord("a")):
+            cap.release()
+            return "previous"
+        if state.previous_requested:
+            state.previous_requested = False
             cap.release()
             return "previous"
         if state.next_requested:
@@ -394,7 +458,11 @@ def play_playlist(videos, start_index, args):
     last_frame = None
 
     def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONUP and state.button_rect and point_in_rect(x, y, state.button_rect):
+        if event != cv2.EVENT_LBUTTONUP:
+            return
+        if state.previous_rect and point_in_rect(x, y, state.previous_rect):
+            state.previous_requested = True
+        elif state.next_rect and point_in_rect(x, y, state.next_rect):
             state.next_requested = True
 
     cv2.setMouseCallback(window, on_mouse)
@@ -440,7 +508,7 @@ def play_playlist(videos, start_index, args):
                 break
             frame = resize_for_preview(frame, args.max_width, args.max_height)
             last_frame = frame.copy()
-            state.button_rect = draw_controls(
+            state.previous_rect, state.next_rect = draw_controls(
                 frame,
                 Path(video).name,
                 index,
@@ -457,10 +525,17 @@ def play_playlist(videos, start_index, args):
                 state.next_requested = True
             if key in (ord("p"), ord("a")):
                 index = (index - 1) % len(videos)
+                state.previous_requested = False
+                state.next_requested = False
+                break
+            if state.previous_requested:
+                index = (index - 1) % len(videos)
+                state.previous_requested = False
                 state.next_requested = False
                 break
             if state.next_requested:
                 index = (index + 1) % len(videos)
+                state.previous_requested = False
                 state.next_requested = False
                 break
         cap.release()
@@ -514,12 +589,14 @@ def parser():
     p.add_argument("--device", default="auto", help="Device for preview generation. Default auto prefers cuda:0, then cpu.")
     p.add_argument("--cpu-threads", type=int, default=4, help="Limit CPU threads while generating a missing preview.")
     p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size while generating a missing preview.")
-    p.add_argument("--direct", action="store_true", help="Draw skeletons directly from .npz on the original video instead of generating a fused preview .avi.")
+    p.add_argument("--direct", action=argparse.BooleanOptionalAction, default=True, help="Draw skeletons directly from .npz on the original video instead of generating a fused preview .avi.")
     p.add_argument("--direct-temporal-display", action=argparse.BooleanOptionalAction, default=True, help="Apply temporal display filtering while drawing direct previews.")
-    p.add_argument("--kpt-thr", type=float, default=0.1, help="Keypoint score threshold used while drawing direct previews.")
-    p.add_argument("--temporal-min-frames", type=int, default=2, help="Hide preview keypoints unless they survive this many consecutive frames.")
-    p.add_argument("--temporal-max-jump", type=float, default=150.0, help="Hide one-frame preview keypoint jumps larger than this many pixels.")
-    p.add_argument("--temporal-min-keypoints", type=int, default=5, help="Hide a preview person if fewer than this many body keypoints are visible.")
+    p.add_argument("--kpt-thr", type=float, default=0.25, help="Keypoint score threshold used while drawing direct previews.")
+    p.add_argument("--direct-bbox-thr", type=float, default=0.3, help="Hide direct-preview people below this bbox score.")
+    p.add_argument("--direct-bbox-margin", type=float, default=0.0, help="Allow this bbox-relative margin when filtering direct-preview keypoints.")
+    p.add_argument("--temporal-min-frames", type=int, default=3, help="Hide preview keypoints unless they survive this many consecutive frames.")
+    p.add_argument("--temporal-max-jump", type=float, default=100.0, help="Hide one-frame preview keypoint jumps larger than this many pixels.")
+    p.add_argument("--temporal-min-keypoints", type=int, default=8, help="Hide a preview person if fewer than this many body keypoints are visible.")
     p.add_argument("--regenerate", action="store_true")
     p.add_argument("--no-window", action="store_true", help="Only generate/check files, do not open OpenCV window.")
     p.add_argument("--speed", type=float, default=1.0)
