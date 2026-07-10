@@ -232,6 +232,112 @@ def filter_direct_points(frame, keypoints, scores, bboxes, bbox_scores, args):
     return filtered_keypoints, filtered_scores, filtered_bboxes, filtered_bbox_scores
 
 
+class PersonStabilizer:
+    def __init__(self, max_distance=180.0, hold_frames=2, kpt_thr=0.25):
+        import numpy as np
+
+        self.max_distance = float(max_distance or 0.0)
+        self.hold_frames = max(0, int(hold_frames or 0))
+        self.kpt_thr = float(kpt_thr)
+        self.previous_centers = None
+        self.previous_keypoints = None
+        self.previous_scores = None
+        self.previous_bboxes = None
+        self.previous_bbox_scores = None
+        self.missing_counts = None
+        self.np = np
+
+    def _center(self, points, scores, bbox):
+        np = self.np
+        valid = (scores[:17] >= self.kpt_thr) & ~np.isnan(points[:17, 0]) & ~np.isnan(points[:17, 1])
+        if valid.sum() >= 3:
+            return np.nanmedian(points[:17][valid], axis=0).astype(np.float32)
+        if not np.isnan(bbox).any():
+            return np.array([(bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5], dtype=np.float32)
+        return np.array([np.nan, np.nan], dtype=np.float32)
+
+    def _ensure_shape(self, keypoints):
+        np = self.np
+        person_count = keypoints.shape[0]
+        if self.previous_centers is None or self.previous_centers.shape[0] != person_count:
+            self.previous_centers = np.full((person_count, 2), np.nan, dtype=np.float32)
+            self.previous_keypoints = np.full_like(keypoints, np.nan)
+            self.previous_scores = np.zeros(keypoints.shape[:2], dtype=np.float32)
+            self.previous_bboxes = np.full((person_count, 4), np.nan, dtype=np.float32)
+            self.previous_bbox_scores = np.zeros((person_count,), dtype=np.float32)
+            self.missing_counts = np.zeros((person_count,), dtype=np.int32)
+
+    def apply(self, keypoints, scores, bboxes, bbox_scores):
+        np = self.np
+        self._ensure_shape(keypoints)
+        person_count = keypoints.shape[0]
+        current_centers = np.stack([
+            self._center(keypoints[i], scores[i], bboxes[i]) for i in range(person_count)
+        ])
+        current_valid = ~np.isnan(current_centers).any(axis=1)
+
+        ordered_keypoints = np.full_like(keypoints, np.nan)
+        ordered_scores = np.zeros_like(scores)
+        ordered_bboxes = np.full_like(bboxes, np.nan)
+        ordered_bbox_scores = np.zeros_like(bbox_scores)
+        ordered_centers = np.full_like(current_centers, np.nan)
+        used_detections = set()
+
+        candidates = []
+        for det_idx, center in enumerate(current_centers):
+            if not current_valid[det_idx]:
+                continue
+            for slot_idx, prev_center in enumerate(self.previous_centers):
+                if np.isnan(prev_center).any():
+                    continue
+                distance = float(np.linalg.norm(center - prev_center))
+                candidates.append((distance, slot_idx, det_idx))
+        for distance, slot_idx, det_idx in sorted(candidates):
+            if self.max_distance > 0 and distance > self.max_distance:
+                continue
+            if det_idx in used_detections or not np.isnan(ordered_centers[slot_idx]).any():
+                continue
+            ordered_keypoints[slot_idx] = keypoints[det_idx]
+            ordered_scores[slot_idx] = scores[det_idx]
+            ordered_bboxes[slot_idx] = bboxes[det_idx]
+            ordered_bbox_scores[slot_idx] = bbox_scores[det_idx]
+            ordered_centers[slot_idx] = current_centers[det_idx]
+            used_detections.add(det_idx)
+
+        for det_idx in range(person_count):
+            if det_idx in used_detections or not current_valid[det_idx]:
+                continue
+            empty_slots = [slot_idx for slot_idx in range(person_count) if np.isnan(ordered_centers[slot_idx]).any()]
+            if not empty_slots:
+                break
+            slot_idx = empty_slots[0]
+            ordered_keypoints[slot_idx] = keypoints[det_idx]
+            ordered_scores[slot_idx] = scores[det_idx]
+            ordered_bboxes[slot_idx] = bboxes[det_idx]
+            ordered_bbox_scores[slot_idx] = bbox_scores[det_idx]
+            ordered_centers[slot_idx] = current_centers[det_idx]
+            used_detections.add(det_idx)
+
+        for slot_idx in range(person_count):
+            if not np.isnan(ordered_centers[slot_idx]).any():
+                self.missing_counts[slot_idx] = 0
+                continue
+            self.missing_counts[slot_idx] += 1
+            if self.missing_counts[slot_idx] <= self.hold_frames and not np.isnan(self.previous_centers[slot_idx]).any():
+                ordered_keypoints[slot_idx] = self.previous_keypoints[slot_idx]
+                ordered_scores[slot_idx] = self.previous_scores[slot_idx]
+                ordered_bboxes[slot_idx] = self.previous_bboxes[slot_idx]
+                ordered_bbox_scores[slot_idx] = self.previous_bbox_scores[slot_idx]
+                ordered_centers[slot_idx] = self.previous_centers[slot_idx]
+
+        self.previous_centers = ordered_centers.copy()
+        self.previous_keypoints = ordered_keypoints.copy()
+        self.previous_scores = ordered_scores.copy()
+        self.previous_bboxes = ordered_bboxes.copy()
+        self.previous_bbox_scores = ordered_bbox_scores.copy()
+        return ordered_keypoints, ordered_scores, ordered_bboxes, ordered_bbox_scores
+
+
 def resize_for_preview(frame, max_width, max_height):
     import cv2
 
@@ -382,7 +488,7 @@ def wait_for_preview(video, args, cv2, window, state, last_frame):
     return job.result
 
 
-def draw_direct_frame(frame, arrays, array_idx, args, display_filter, cv2):
+def draw_direct_frame(frame, arrays, array_idx, args, display_filter, person_stabilizer, cv2):
     if array_idx < 0 or array_idx >= arrays["keypoints"].shape[0]:
         return frame
     keypoints = arrays["keypoints"][array_idx]
@@ -390,6 +496,8 @@ def draw_direct_frame(frame, arrays, array_idx, args, display_filter, cv2):
     bboxes = arrays["bboxes"][array_idx]
     bbox_scores = arrays["bbox_scores"][array_idx]
     keypoints, scores, bboxes, bbox_scores = filter_direct_points(frame, keypoints, scores, bboxes, bbox_scores, args)
+    if args.stabilize_people:
+        keypoints, scores, bboxes, bbox_scores = person_stabilizer.apply(keypoints, scores, bboxes, bbox_scores)
     if args.direct_temporal_display:
         keypoints, scores, bboxes, bbox_scores = display_filter.apply_arrays(keypoints, scores, bboxes, bbox_scores)
     draw_skeleton(frame, keypoints, scores, bboxes, bbox_scores, args.kpt_thr, cv2)
@@ -410,6 +518,11 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
         args.temporal_min_keypoints,
         args.kpt_thr,
     )
+    person_stabilizer = PersonStabilizer(
+        args.person_match_distance,
+        args.person_hold_frames,
+        args.kpt_thr,
+    )
     frame_idx = 0
     while True:
         ok, frame = cap.read()
@@ -417,7 +530,7 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
             cap.release()
             return "ended"
         array_idx = frame_to_array.get(frame_idx, frame_idx)
-        frame = draw_direct_frame(frame, arrays, array_idx, args, display_filter, cv2)
+        frame = draw_direct_frame(frame, arrays, array_idx, args, display_filter, person_stabilizer, cv2)
         frame = resize_for_preview(frame, args.max_width, args.max_height)
         state.previous_rect, state.next_rect = draw_controls(
             frame,
@@ -594,6 +707,9 @@ def parser():
     p.add_argument("--kpt-thr", type=float, default=0.25, help="Keypoint score threshold used while drawing direct previews.")
     p.add_argument("--direct-bbox-thr", type=float, default=0.3, help="Hide direct-preview people below this bbox score.")
     p.add_argument("--direct-bbox-margin", type=float, default=0.0, help="Allow this bbox-relative margin when filtering direct-preview keypoints.")
+    p.add_argument("--stabilize-people", action=argparse.BooleanOptionalAction, default=True, help="Keep direct-preview person slots stable across frames.")
+    p.add_argument("--person-match-distance", type=float, default=180.0, help="Maximum pixel distance for matching people to the previous frame.")
+    p.add_argument("--person-hold-frames", type=int, default=2, help="Hold the last visible skeleton for this many missing frames.")
     p.add_argument("--temporal-min-frames", type=int, default=3, help="Hide preview keypoints unless they survive this many consecutive frames.")
     p.add_argument("--temporal-max-jump", type=float, default=100.0, help="Hide one-frame preview keypoint jumps larger than this many pixels.")
     p.add_argument("--temporal-min-keypoints", type=int, default=8, help="Hide a preview person if fewer than this many body keypoints are visible.")
