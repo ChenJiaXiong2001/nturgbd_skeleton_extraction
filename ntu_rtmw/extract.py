@@ -19,6 +19,7 @@ from .device import resolve_device
 from .download import ensure_rtmdet_weights, ensure_rtmw_weights
 
 np = None
+CPU_THREADS_CONFIGURED = False
 OPENMMLAB_MODULES = ["mmengine", "mmcv", "mmdet", "mmpose"]
 BODY_EDGES = [
     (5, 7), (7, 9), (6, 8), (8, 10), (5, 6),
@@ -352,9 +353,11 @@ def build_inferencer(args):
 
 
 def configure_cpu_threads(args):
+    global CPU_THREADS_CONFIGURED
     threads = int(getattr(args, "cpu_threads", 0) or 0)
-    if threads <= 0:
+    if threads <= 0 or CPU_THREADS_CONFIGURED:
         return
+    CPU_THREADS_CONFIGURED = True
     value = str(threads)
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[name] = value
@@ -362,10 +365,6 @@ def configure_cpu_threads(args):
         import torch
 
         torch.set_num_threads(threads)
-        try:
-            torch.set_num_interop_threads(max(1, min(threads, 4)))
-        except RuntimeError:
-            pass
     except Exception:
         pass
     try:

@@ -130,8 +130,8 @@ def extract_pose_archive_by_archive(args, weights_path, det_weights_path):
 
 def main():
     args = parser().parse_args()
-    args.device = resolve_device(args.device)
     configure_cpu_threads(args)
+    args.device = resolve_device(args.device)
     print("device {}".format(args.device), flush=True)
     ensure_dirs(args.archives_dir, args.extract_dir, args.skeleton_dir, args.processed_dir, RUNS_DIR, MODELS_DIR)
     check_ntu_rgb_archives(args.archives_dir, require_all=args.require_all_archives)
