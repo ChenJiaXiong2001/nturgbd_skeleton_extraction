@@ -77,6 +77,9 @@ Then run the full pipeline with Python 3.10:
 py -3.10 main.py
 ```
 
+By default, `--device auto` prefers `cuda:0` when PyTorch can see a GPU, then
+falls back to CPU.
+
 The RTMW and RTMDet checkpoints are downloaded once into:
 
 ```text
@@ -93,17 +96,33 @@ py -3.10 -m ntu_rtmw.download
 Require all 32 archives before starting:
 
 ```powershell
-py -3.10 main.py --device cuda:0 --require-all-archives
+py -3.10 main.py --require-all-archives
 ```
 
 It will:
 
 - download RTMW and RTMDet weights into `models/`
-- extract archives into `data/extracted/`
-- find NTU RGB videos recursively
-- extract RTMW skeletons into `data/skeletons_rtmw/`
+- extract one archive at a time into `data/extracted/`
+- extract RTMW skeletons from that archive into `data/skeletons_rtmw/`
+- delete that archive's expanded folder, leaving the original `.zip`
 - write train/val manifests into `data/processed/`
 - train a baseline GRU model into `runs/`
+
+This low-storage mode is the default. At most one archive is expanded while the
+pipeline is running, so `data/extracted/` should not keep growing. The generated
+`.npz` skeleton files are kept because training reads those files later.
+
+Keep expanded videos after processing:
+
+```powershell
+py -3.10 main.py --keep-extracted
+```
+
+Use the old mode that extracts every archive first:
+
+```powershell
+py -3.10 main.py --extract-all-first
+```
 
 Prepare data only:
 

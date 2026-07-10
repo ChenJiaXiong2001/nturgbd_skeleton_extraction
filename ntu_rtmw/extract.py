@@ -13,6 +13,7 @@ from .constants import (
     RTMW_WEIGHTS_PATH,
     VIDEO_EXTENSIONS,
 )
+from .device import resolve_device
 from .download import ensure_rtmdet_weights, ensure_rtmw_weights
 
 np = None
@@ -347,6 +348,8 @@ def build_inferencer(args):
 
 def run(args):
     ensure_supported_python()
+    args.device = resolve_device(args.device)
+    print("device {}".format(args.device), flush=True)
     if str(args.pose2d_weights) == str(RTMW_WEIGHTS_PATH):
         args.pose2d_weights = str(RTMW_WEIGHTS_PATH if Path(RTMW_WEIGHTS_PATH).exists() else ensure_rtmw_weights())
     if args.det_model != "whole_image" and str(args.det_weights) == str(RTMDET_WEIGHTS_PATH):
@@ -383,7 +386,7 @@ def parser():
     p.add_argument("--pose2d-weights", default=str(RTMW_WEIGHTS_PATH))
     p.add_argument("--det-model", default=RTMDET_CONFIG)
     p.add_argument("--det-weights", default=str(RTMDET_WEIGHTS_PATH))
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto", help="Device for pose extraction. Default auto prefers cuda:0, then cpu.")
     p.add_argument("--max-persons", type=int, default=2)
     p.add_argument("--bbox-thr", type=float, default=0.3)
     p.add_argument("--kpt-thr", type=float, default=0.1)

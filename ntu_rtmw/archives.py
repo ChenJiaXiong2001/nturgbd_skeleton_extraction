@@ -74,6 +74,22 @@ def extract_all(archives_dir, extract_dir, skip_existing=True, check_expected=Tr
     return extracted
 
 
+def remove_extracted(target, extract_dir):
+    target = Path(target)
+    if not target.exists():
+        return
+    root = Path(extract_dir).resolve()
+    resolved = target.resolve()
+    if resolved == root:
+        raise SystemExit("Refusing to delete extraction root: {}".format(root))
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise SystemExit("Refusing to delete outside extraction root: {}".format(resolved)) from exc
+    print("delete extracted {}".format(resolved), flush=True)
+    shutil.rmtree(resolved)
+
+
 def extraction_dir_name(archive):
     name = Path(archive).name.lower()
     if name.startswith("nturgbd_rgb_s") and name.endswith(".zip"):
