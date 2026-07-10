@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import multiprocessing
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -392,6 +393,13 @@ def split_jobs(jobs, workers):
     return [chunk for chunk in chunks if chunk]
 
 
+def process_pool_context(args):
+    device = str(getattr(args, "device", "") or "").lower()
+    if device.startswith("cuda"):
+        return multiprocessing.get_context("spawn")
+    return None
+
+
 def run_worker(worker_id, jobs, args):
     inferencer = build_inferencer(args)
     outputs = []
@@ -445,9 +453,14 @@ def run(args):
             outputs.append(out)
         return outputs
 
-    print("parallel RTMW workers: {}".format(workers), flush=True)
+    mp_context = process_pool_context(args)
+    start_method = mp_context.get_start_method() if mp_context else multiprocessing.get_start_method()
+    print("parallel RTMW workers: {} ({})".format(workers, start_method), flush=True)
     chunks = split_jobs(jobs, workers)
-    with ProcessPoolExecutor(max_workers=workers) as executor:
+    executor_kwargs = {"max_workers": workers}
+    if mp_context is not None:
+        executor_kwargs["mp_context"] = mp_context
+    with ProcessPoolExecutor(**executor_kwargs) as executor:
         futures = [executor.submit(run_worker, idx + 1, chunk, args) for idx, chunk in enumerate(chunks)]
         for future in as_completed(futures):
             outputs.extend(Path(path) for path in future.result())

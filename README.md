@@ -138,7 +138,10 @@ py -3.10 main.py --workers 2
 ```
 
 Each worker loads its own RTMDet and RTMW models, so CPU and GPU memory use both
-increase with the worker count.
+increase with the worker count. On Linux with CUDA, parallel extraction uses the
+`spawn` multiprocessing start method so each worker can initialize CUDA safely.
+If a multi-worker run is unstable, first fall back to `--workers 1` and increase
+`--pose-batch-size` instead.
 
 Show skeleton extraction live for one video:
 
