@@ -697,6 +697,8 @@ def play_direct_single(video, skeleton_path, args):
 def parser():
     p = argparse.ArgumentParser(description="Generate and play one RTMW skeleton preview.")
     p.add_argument("--video", help="Specific NTU *_rgb.avi file. Defaults to the first extracted video.")
+    p.add_argument("--index", type=int, default=1, help="1-based video index in the sorted preview playlist.")
+    p.add_argument("--list", action="store_true", help="List indexed preview videos and exit.")
     p.add_argument("--vis-dir", default=str(DEFAULT_VIS_DIR))
     p.add_argument("--out-dir", default=str(SKELETON_DIR))
     p.add_argument("--device", default="auto", help="Device for preview generation. Default auto prefers cuda:0, then cpu.")
@@ -725,6 +727,11 @@ def parser():
 def main():
     args = parser().parse_args()
     videos = list_videos(EXTRACTED_DIR)
+    if args.list:
+        for idx, path in enumerate(videos, 1):
+            print("{:4d}  {}".format(idx, path), flush=True)
+        return
+
     if args.video:
         video = Path(args.video).resolve()
         resolved = [p.resolve() for p in videos]
@@ -734,7 +741,9 @@ def main():
             videos = [video]
             start_index = 0
     else:
-        start_index = 0
+        if args.index < 1 or args.index > len(videos):
+            raise SystemExit("--index must be between 1 and {}.".format(len(videos)))
+        start_index = args.index - 1
     video = videos[start_index]
     if args.no_window:
         if args.direct:

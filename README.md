@@ -165,6 +165,8 @@ Open a small skeleton preview window:
 
 ```powershell
 py -3.10 preview.py
+py -3.10 preview.py --list
+py -3.10 preview.py --index 5
 py -3.10 preview.py --kpt-thr 0.35 --temporal-min-frames 4 --temporal-min-keypoints 10
 py -3.10 preview.py --person-match-distance 220 --person-hold-frames 3
 py -3.10 preview.py --no-direct
@@ -183,6 +185,8 @@ The preview window auto-plays the next video when one clip ends. It also has
 `Prev` and `Next` buttons. You can press `n` for next, `p` for previous, and
 `q` or `Esc` to quit. Add `--loop-current` if you want one clip to replay
 instead.
+Use `--list` to print numbered videos, then `--index N` to start previewing
+from the Nth video.
 For close two-person interactions, direct preview keeps person slots stable
 across frames by default. Tune `--person-match-distance` and
 `--person-hold-frames` if identities still swap or skeletons briefly disappear.
