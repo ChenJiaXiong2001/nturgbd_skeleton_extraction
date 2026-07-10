@@ -19,7 +19,6 @@ from .constants import (
     RTMDET_CONFIG,
     RTMDET_WEIGHTS_PATH,
     RTMW_WEIGHTS_URL,
-    RUNS_DIR,
     SKELETON_DIR,
 )
 from .download import ensure_rtmdet_weights, ensure_rtmw_weights
@@ -29,12 +28,12 @@ from .manifest import build_manifest
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Prepare NTU RGB+D from archives to training.")
+    p = argparse.ArgumentParser(description="Prepare NTU RGB+D archives into RTMW skeleton files.")
     p.add_argument("--archives-dir", default=str(RAW_ARCHIVES_DIR))
     p.add_argument("--extract-dir", default=str(EXTRACTED_DIR))
     p.add_argument("--skeleton-dir", default=str(SKELETON_DIR))
     p.add_argument("--processed-dir", default=str(PROCESSED_DIR))
-    p.add_argument("--device", default="auto", help="Device for pose extraction/training. Default auto prefers cuda:0, then cpu.")
+    p.add_argument("--device", default="auto", help="Device for pose extraction. Default auto prefers cuda:0, then cpu.")
     p.add_argument("--det-model", default=RTMDET_CONFIG)
     p.add_argument("--det-weights", default=str(RTMDET_WEIGHTS_PATH))
     p.add_argument("--show-skeleton", action="store_true")
@@ -50,9 +49,6 @@ def parser():
     p.add_argument("--keep-extracted", action="store_true", help="Keep expanded archive folders after pose extraction.")
     p.add_argument("--extract-all-first", action="store_true", help="Use the old mode: extract every archive before pose extraction.")
     p.add_argument("--no-pose", action="store_true")
-    p.add_argument("--no-train", action="store_true")
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--cpu-threads", type=int, default=0, help="Limit CPU compute threads per process. Try 4 or 8 if CPU is pinned.")
     p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size. Try 4 or 8 when CPU is saturated and GPU is underused.")
     p.add_argument("--workers", type=int, default=1, help="Parallel video extraction workers. Try 2 first on one GPU.")
@@ -133,7 +129,7 @@ def main():
     configure_cpu_threads(args)
     args.device = resolve_device(args.device)
     print("device {}".format(args.device), flush=True)
-    ensure_dirs(args.archives_dir, args.extract_dir, args.skeleton_dir, args.processed_dir, RUNS_DIR, MODELS_DIR)
+    ensure_dirs(args.archives_dir, args.extract_dir, args.skeleton_dir, args.processed_dir, MODELS_DIR)
     check_ntu_rgb_archives(args.archives_dir, require_all=args.require_all_archives)
     weights_path = RTMW_WEIGHTS_URL if args.no_download_weights else str(ensure_rtmw_weights())
     det_weights_path = args.det_weights
@@ -155,17 +151,3 @@ def main():
         protocol=args.protocol,
         ntu_version=version,
     )
-
-    if not args.no_train:
-        from .train import run as train_run
-
-        train_run(Namespace(
-            manifest=str(manifest),
-            out_dir=str(RUNS_DIR / "gru_{}".format(args.protocol)),
-            device=args.device,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            frames=64,
-            hidden=256,
-            lr=3e-4,
-        ))

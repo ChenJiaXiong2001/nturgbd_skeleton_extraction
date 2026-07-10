@@ -105,12 +105,11 @@ It will:
 - extract one archive at a time into `data/extracted/`
 - extract RTMW skeletons from that archive into `data/skeletons_rtmw/`
 - delete that archive's expanded folder, leaving the original `.zip`
-- write train/val manifests into `data/processed/`
-- train a baseline GRU model into `runs/`
+- write NTU protocol manifests into `data/processed/`
 
 This low-storage mode is the default. At most one archive is expanded while the
 pipeline is running, so `data/extracted/` should not keep growing. The generated
-`.npz` skeleton files are kept because training reads those files later.
+`.npz` skeleton files are kept for downstream action recognition or analysis.
 
 Keep expanded videos after processing:
 
@@ -124,16 +123,10 @@ Use the old mode that extracts every archive first:
 py -3.10 main.py --extract-all-first
 ```
 
-Prepare data only:
-
-```powershell
-py -3.10 main.py --no-train
-```
-
 When CPU is pinned but GPU use is low, keep one worker and try batching frames:
 
 ```powershell
-py -3.10 main.py --no-train --pose-batch-size 4 --cpu-threads 8
+py -3.10 main.py --pose-batch-size 4 --cpu-threads 8
 ```
 
 Raise `--pose-batch-size` to `8` if VRAM is comfortable. Lower
@@ -141,7 +134,7 @@ Raise `--pose-batch-size` to `8` if VRAM is comfortable. Lower
 workers only when CPU still has headroom:
 
 ```powershell
-py -3.10 main.py --no-train --workers 2
+py -3.10 main.py --workers 2
 ```
 
 Each worker loads its own RTMDet and RTMW models, so CPU and GPU memory use both
@@ -150,19 +143,19 @@ increase with the worker count.
 Show skeleton extraction live for one video:
 
 ```powershell
-py -3.10 main.py --limit 1 --show-skeleton --no-train
+py -3.10 main.py --limit 1 --show-skeleton
 ```
 
 Save skeleton visualization previews:
 
 ```powershell
-py -3.10 main.py --limit 1 --visualize-dir data\visualizations --no-train
+py -3.10 main.py --limit 1 --visualize-dir data\visualizations
 ```
 
 Re-extract existing skeleton files with the accurate detector path:
 
 ```powershell
-py -3.10 main.py --limit 1 --overwrite --visualize-dir data\visualizations_310 --no-train
+py -3.10 main.py --limit 1 --overwrite --visualize-dir data\visualizations_310
 ```
 
 Open a small skeleton preview window:
@@ -209,12 +202,6 @@ their scores become `0`. Add `--no-filter-output-to-bbox` only when you want to
 inspect raw RTMW drift. With YOLO, the default `--pose-input crop` explicitly
 crops each detected person box, runs RTMW on the crop, then offsets keypoints
 back into the full camera frame.
-
-Train later from an existing manifest:
-
-```powershell
-py -3.10 -m ntu_rtmw.train --manifest data\processed\manifest_xsub.csv --device cuda:0
-```
 
 ## Single-Step Commands
 

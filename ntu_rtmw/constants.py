@@ -8,7 +8,6 @@ RAW_ARCHIVES_DIR = DATA_DIR / "raw_archives"
 EXTRACTED_DIR = DATA_DIR / "extracted"
 SKELETON_DIR = DATA_DIR / "skeletons_rtmw"
 PROCESSED_DIR = DATA_DIR / "processed"
-RUNS_DIR = PROJECT_ROOT / "runs"
 MODELS_DIR = PROJECT_ROOT / "models"
 
 VIDEO_EXTENSIONS = {".avi", ".mp4", ".mov", ".mkv"}
