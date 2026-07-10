@@ -186,12 +186,250 @@ def assign_slots(items, previous, max_persons, max_distance):
     return slots, centers
 
 
+def copy_pose_arrays(arrays):
+    return {
+        "keypoints": arrays["keypoints"].copy(),
+        "scores": arrays["scores"].copy(),
+        "bboxes": arrays["bboxes"].copy(),
+        "bbox_scores": arrays["bbox_scores"].copy(),
+        "frame_indices": arrays["frame_indices"].copy(),
+    }
+
+
+def invalidate_keypoints(arrays, invalid):
+    arrays["keypoints"][invalid] = np.nan
+    arrays["scores"][invalid] = 0
+
+
+def filter_arrays_to_bboxes(arrays, margin_ratio):
+    require_numpy()
+    filtered = copy_pose_arrays(arrays)
+    keypoints = filtered["keypoints"]
+    bboxes = filtered["bboxes"]
+    invalid = np.zeros(filtered["scores"].shape, dtype=bool)
+    for frame_idx in range(keypoints.shape[0]):
+        for person_idx in range(keypoints.shape[1]):
+            bbox = bboxes[frame_idx, person_idx]
+            if np.isnan(bbox).any():
+                invalid[frame_idx, person_idx] = True
+                continue
+            x1, y1, x2, y2 = bbox.astype(float)
+            width = max(1.0, x2 - x1)
+            height = max(1.0, y2 - y1)
+            margin_x = width * margin_ratio
+            margin_y = height * margin_ratio
+            x1 -= margin_x
+            x2 += margin_x
+            y1 -= margin_y
+            y2 += margin_y
+            points = keypoints[frame_idx, person_idx]
+            invalid[frame_idx, person_idx] = (
+                (points[:, 0] < x1)
+                | (points[:, 0] > x2)
+                | (points[:, 1] < y1)
+                | (points[:, 1] > y2)
+                | np.isnan(points[:, 0])
+                | np.isnan(points[:, 1])
+            )
+    invalidate_keypoints(filtered, invalid)
+    return filtered
+
+
+def filter_arrays_to_frame(arrays, width, height):
+    require_numpy()
+    filtered = copy_pose_arrays(arrays)
+    points = filtered["keypoints"]
+    invalid = (
+        (points[..., 0] < 0)
+        | (points[..., 0] >= width)
+        | (points[..., 1] < 0)
+        | (points[..., 1] >= height)
+        | np.isnan(points[..., 0])
+        | np.isnan(points[..., 1])
+    )
+    invalidate_keypoints(filtered, invalid)
+    return filtered
+
+
+def remove_short_valid_runs(valid, min_frames):
+    if min_frames <= 1 or valid.size == 0:
+        return valid
+    cleaned = valid.copy()
+    frames, persons, keypoints = valid.shape
+    for person_idx in range(persons):
+        for keypoint_idx in range(keypoints):
+            start = None
+            for frame_idx in range(frames + 1):
+                active = frame_idx < frames and valid[frame_idx, person_idx, keypoint_idx]
+                if active and start is None:
+                    start = frame_idx
+                elif not active and start is not None:
+                    if frame_idx - start < min_frames:
+                        cleaned[start:frame_idx, person_idx, keypoint_idx] = False
+                    start = None
+    return cleaned
+
+
+def remove_one_frame_jumps(valid, points, max_jump):
+    require_numpy()
+    if max_jump <= 0 or valid.shape[0] < 3:
+        return valid
+    cleaned = valid.copy()
+    for frame_idx in range(1, valid.shape[0] - 1):
+        prev_valid = valid[frame_idx - 1]
+        curr_valid = valid[frame_idx]
+        next_valid = valid[frame_idx + 1]
+        common = prev_valid & curr_valid & next_valid
+        if not common.any():
+            continue
+        prev_dist = np.linalg.norm(points[frame_idx] - points[frame_idx - 1], axis=-1)
+        next_dist = np.linalg.norm(points[frame_idx] - points[frame_idx + 1], axis=-1)
+        bridge_dist = np.linalg.norm(points[frame_idx - 1] - points[frame_idx + 1], axis=-1)
+        spike = common & (prev_dist > max_jump) & (next_dist > max_jump) & (bridge_dist <= max_jump)
+        cleaned[frame_idx, spike] = False
+    return cleaned
+
+
+def hide_sparse_people(arrays, valid, min_keypoints):
+    if min_keypoints <= 0:
+        return valid
+    cleaned = valid.copy()
+    body_count = cleaned[:, :, :17].sum(axis=2)
+    sparse = body_count < min_keypoints
+    if sparse.any():
+        cleaned[sparse] = False
+        arrays["bboxes"][sparse] = np.nan
+        arrays["bbox_scores"][sparse] = 0
+    return cleaned
+
+
+def temporal_cleanup_arrays(arrays, min_frames, max_jump, min_keypoints, kpt_thr):
+    require_numpy()
+    cleaned = copy_pose_arrays(arrays)
+    points = cleaned["keypoints"]
+    valid = (cleaned["scores"] >= kpt_thr) & ~np.isnan(points[..., 0]) & ~np.isnan(points[..., 1])
+    valid = remove_one_frame_jumps(valid, points, max_jump)
+    valid = remove_short_valid_runs(valid, min_frames)
+    valid = hide_sparse_people(cleaned, valid, min_keypoints)
+    invalidate_keypoints(cleaned, ~valid)
+    return cleaned
+
+
+def video_size(video):
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        return None
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return width, height
+
+
+def postprocess_arrays(arrays, video, args):
+    require_numpy()
+    processed = arrays
+    if getattr(args, "filter_output_to_bbox", True):
+        processed = filter_arrays_to_bboxes(processed, getattr(args, "output_bbox_margin", 0.0))
+    if getattr(args, "filter_output_to_frame", True):
+        size = video_size(video)
+        if size is not None:
+            processed = filter_arrays_to_frame(processed, size[0], size[1])
+    processed = temporal_cleanup_arrays(
+        processed,
+        getattr(args, "temporal_min_frames", 1),
+        getattr(args, "temporal_max_jump", 0.0),
+        getattr(args, "temporal_min_keypoints", 0),
+        getattr(args, "kpt_thr", 0.1),
+    )
+    return processed
+
+
+class TemporalDisplayFilter:
+    def __init__(self, min_frames=2, max_jump=150.0, min_keypoints=5, kpt_thr=0.1):
+        require_numpy()
+        self.min_frames = max(1, int(min_frames or 1))
+        self.max_jump = float(max_jump or 0.0)
+        self.min_keypoints = max(0, int(min_keypoints or 0))
+        self.kpt_thr = float(kpt_thr)
+        self.streaks = None
+        self.previous_points = None
+        self.previous_valid = None
+
+    def _ensure_shape(self, keypoints):
+        shape = keypoints.shape[:-1]
+        if self.streaks is None or self.streaks.shape != shape:
+            self.streaks = np.zeros(shape, dtype=np.int32)
+            self.previous_points = np.full(keypoints.shape, np.nan, dtype=np.float32)
+            self.previous_valid = np.zeros(shape, dtype=bool)
+
+    def apply_arrays(self, keypoints, scores, bboxes, bbox_scores):
+        self._ensure_shape(keypoints)
+        raw_points = keypoints.copy()
+        raw_valid = (scores >= self.kpt_thr) & ~np.isnan(raw_points[..., 0]) & ~np.isnan(raw_points[..., 1])
+        stable_valid = raw_valid.copy()
+        if self.max_jump > 0 and self.previous_valid is not None:
+            compared = raw_valid & self.previous_valid
+            jumps = np.zeros(raw_valid.shape, dtype=bool)
+            if compared.any():
+                dist = np.linalg.norm(raw_points - self.previous_points, axis=-1)
+                jumps = compared & (dist > self.max_jump)
+            stable_valid &= ~jumps
+
+        self.streaks = np.where(stable_valid, self.streaks + 1, 0)
+        visible = stable_valid & (self.streaks >= self.min_frames)
+
+        update = stable_valid
+        self.previous_points[update] = raw_points[update]
+        self.previous_valid = update
+
+        filtered_keypoints = keypoints.copy()
+        filtered_scores = scores.copy()
+        filtered_bboxes = bboxes.copy()
+        filtered_bbox_scores = bbox_scores.copy()
+        if self.min_keypoints > 0:
+            body_count = visible[:, :17].sum(axis=1)
+            sparse = body_count < self.min_keypoints
+            visible[sparse] = False
+            filtered_bboxes[sparse] = np.nan
+            filtered_bbox_scores[sparse] = 0
+        filtered_keypoints[~visible] = np.nan
+        filtered_scores[~visible] = 0
+        return filtered_keypoints, filtered_scores, filtered_bboxes, filtered_bbox_scores
+
+    def apply_latest(self, latest):
+        if latest is None:
+            return None
+        filtered = dict(latest)
+        k, s, b, bs = self.apply_arrays(
+            latest["keypoints"],
+            latest["scores"],
+            latest["bboxes"],
+            latest["bbox_scores"],
+        )
+        filtered["keypoints"] = k
+        filtered["scores"] = s
+        filtered["bboxes"] = b
+        filtered["bbox_scores"] = bs
+        return filtered
+
+
 def infer_video(inferencer, video, args):
     require_numpy()
     keypoints, scores, bboxes, bbox_scores = [], [], [], []
     previous = None
     num_kpts = 133
     visualizer = SkeletonVisualizer(video, args)
+    display_filter = TemporalDisplayFilter(
+        getattr(args, "temporal_min_frames", 1),
+        getattr(args, "temporal_max_jump", 0.0),
+        getattr(args, "temporal_min_keypoints", 0),
+        args.kpt_thr,
+    )
     kwargs = {"show": False, "return_vis": False, "draw_bbox": False, "kpt_thr": args.kpt_thr}
     pose_batch_size = max(1, int(getattr(args, "pose_batch_size", 1) or 1))
     if pose_batch_size > 1:
@@ -220,7 +458,7 @@ def infer_video(inferencer, video, args):
             scores.append(s)
             bboxes.append(b)
             bbox_scores.append(bs)
-            visualizer.draw(k, s, b, bs, args.kpt_thr)
+            visualizer.draw_live(k, s, b, bs, args.kpt_thr, display_filter)
             if (frame_idx + 1) % 100 == 0:
                 print("  {} frames".format(frame_idx + 1), flush=True)
     finally:
@@ -233,17 +471,21 @@ def infer_video(inferencer, video, args):
             "bbox_scores": np.empty((0, args.max_persons), dtype=np.float32),
             "frame_indices": np.empty((0,), dtype=np.int32),
         }
-    return {
+    arrays = {
         "keypoints": np.stack(keypoints),
         "scores": np.stack(scores),
         "bboxes": np.stack(bboxes),
         "bbox_scores": np.stack(bbox_scores),
         "frame_indices": np.arange(len(keypoints), dtype=np.int32),
     }
+    arrays = postprocess_arrays(arrays, video, args)
+    visualizer.draw_sequence(arrays, args.kpt_thr)
+    return arrays
 
 
 class SkeletonVisualizer:
     def __init__(self, video, args):
+        self.video = video
         self.show = getattr(args, "show_skeleton", False)
         self.out_dir = Path(args.visualize_dir) if getattr(args, "visualize_dir", None) else None
         self.cap = None
@@ -263,32 +505,52 @@ class SkeletonVisualizer:
             return
         if self.out_dir is not None:
             self.out_dir.mkdir(parents=True, exist_ok=True)
-            fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            out_path = self.out_dir / "{}_skeleton.avi".format(Path(video).stem)
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
+            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.out_path = self.out_dir / "{}_skeleton.avi".format(Path(video).stem)
             self.preview_path = self.out_dir / "{}_skeleton.jpg".format(Path(video).stem)
-            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-            self.writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
-            print("  visualization {}".format(out_path), flush=True)
+            print("  visualization {}".format(self.out_path), flush=True)
 
-    def draw(self, keypoints, scores, bboxes, bbox_scores, kpt_thr):
-        if self.cap is None:
+    def draw_live(self, keypoints, scores, bboxes, bbox_scores, kpt_thr, display_filter):
+        if self.cap is None or not self.show:
             return
         ok, frame = self.cap.read()
         if not ok:
             return
+        keypoints, scores, bboxes, bbox_scores = display_filter.apply_arrays(keypoints, scores, bboxes, bbox_scores)
         draw_skeleton(frame, keypoints, scores, bboxes, bbox_scores, kpt_thr, self.cv2)
-        if self.writer is not None:
+        self.cv2.imshow(self.window, frame)
+        if self.cv2.waitKey(1) & 0xFF == ord("q"):
+            self.show = False
+            self.cv2.destroyWindow(self.window)
+
+    def draw_sequence(self, arrays, kpt_thr):
+        if self.out_dir is None or self.cap is None:
+            return
+        self.cap.release()
+        self.cap = self.cv2.VideoCapture(str(self.video))
+        if not self.cap.isOpened():
+            return
+        fourcc = self.cv2.VideoWriter_fourcc(*"MJPG")
+        self.writer = self.cv2.VideoWriter(str(self.out_path), fourcc, self.fps, (self.width, self.height))
+        for frame_idx in range(arrays["keypoints"].shape[0]):
+            ok, frame = self.cap.read()
+            if not ok:
+                break
+            draw_skeleton(
+                frame,
+                arrays["keypoints"][frame_idx],
+                arrays["scores"][frame_idx],
+                arrays["bboxes"][frame_idx],
+                arrays["bbox_scores"][frame_idx],
+                kpt_thr,
+                self.cv2,
+            )
             self.writer.write(frame)
-        if self.preview_path is not None and not self.preview_written:
-            self.cv2.imwrite(str(self.preview_path), frame)
-            self.preview_written = True
-        if self.show:
-            self.cv2.imshow(self.window, frame)
-            if self.cv2.waitKey(1) & 0xFF == ord("q"):
-                self.show = False
-                self.cv2.destroyWindow(self.window)
+            if self.preview_path is not None and not self.preview_written:
+                self.cv2.imwrite(str(self.preview_path), frame)
+                self.preview_written = True
 
     def close(self):
         if self.cap is not None:
@@ -482,6 +744,12 @@ def parser():
     p.add_argument("--bbox-thr", type=float, default=0.3)
     p.add_argument("--kpt-thr", type=float, default=0.1)
     p.add_argument("--tracking-distance", type=float, default=150.0)
+    p.add_argument("--filter-output-to-bbox", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--output-bbox-margin", type=float, default=0.0)
+    p.add_argument("--filter-output-to-frame", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--temporal-min-frames", type=int, default=2)
+    p.add_argument("--temporal-max-jump", type=float, default=150.0)
+    p.add_argument("--temporal-min-keypoints", type=int, default=5)
     p.add_argument("--show-skeleton", action="store_true")
     p.add_argument("--visualize-dir")
     p.add_argument("--skip-existing", action="store_true")

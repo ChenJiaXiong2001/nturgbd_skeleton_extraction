@@ -13,6 +13,7 @@ from .constants import (
 )
 from .download import ensure_rtmdet_weights, ensure_rtmw_weights
 from .extract import (
+    TemporalDisplayFilter,
     assign_slots,
     build_inferencer,
     draw_skeleton,
@@ -82,6 +83,12 @@ class PoseWorker:
         self.stop_requested = False
         self.busy = False
         self.error = None
+        self.display_filter = TemporalDisplayFilter(
+            args.temporal_min_frames,
+            args.temporal_max_jump,
+            args.temporal_min_keypoints,
+            args.kpt_thr,
+        )
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -145,6 +152,7 @@ class PoseWorker:
                     latest = self._result_to_arrays(result, time.perf_counter() - started)
                 if self.args.filter_output_to_bbox:
                     latest = filter_pose_output_to_bboxes(latest, self.args.output_bbox_margin)
+                latest = self.display_filter.apply_latest(latest)
                 with self.condition:
                     self.latest = latest
                     self.error = None
@@ -508,6 +516,9 @@ def parser():
     p.add_argument("--bbox-thr", type=float, default=0.3)
     p.add_argument("--kpt-thr", type=float, default=0.1)
     p.add_argument("--tracking-distance", type=float, default=120.0)
+    p.add_argument("--temporal-min-frames", type=int, default=2)
+    p.add_argument("--temporal-max-jump", type=float, default=150.0)
+    p.add_argument("--temporal-min-keypoints", type=int, default=5)
     p.add_argument("--infer-every", type=int, default=1)
     p.add_argument("--min-interval", type=float, default=0.0)
     p.add_argument("--flip", action=argparse.BooleanOptionalAction, default=True)

@@ -202,6 +202,7 @@ py -3.10 camera.py --output-bbox-margin 0.1
 py -3.10 camera.py --pose-input frame
 py -3.10 camera.py --crop-margin 0.1
 py -3.10 camera.py --det-backend mmdet
+py -3.10 camera.py --temporal-min-frames 3 --temporal-min-keypoints 8
 ```
 
 The camera window is responsive while RTMW runs in a background thread. On CPU,
@@ -212,6 +213,8 @@ their scores become `0`. Add `--no-filter-output-to-bbox` only when you want to
 inspect raw RTMW drift. With YOLO, the default `--pose-input crop` explicitly
 crops each detected person box, runs RTMW on the crop, then offsets keypoints
 back into the full camera frame.
+Increase `--temporal-min-frames` or `--temporal-min-keypoints` if you want the
+camera display to hide more one-frame skeleton flashes.
 
 ## Single-Step Commands
 
@@ -263,6 +266,16 @@ Each `.npz` contains:
 - `metadata`: JSON string with NTU filename fields when available
 
 Missing people/keypoints are padded with `NaN` coordinates and zero scores.
+By default, keypoints outside the detected person box or outside the video frame
+are also written as `NaN` with score `0`, which avoids stray skeleton nodes in
+low-confidence poses such as squats. Use `--no-filter-output-to-bbox` to inspect
+raw RTMW drift, or `--output-bbox-margin 0.1` to allow a small margin around the
+detected box.
+The extractor also applies temporal cleanup: a keypoint must appear for at
+least two consecutive frames, one-frame position jumps over 150 pixels are
+removed, and person detections with fewer than five valid body keypoints are
+hidden. Tune this with `--temporal-min-frames`, `--temporal-max-jump`, and
+`--temporal-min-keypoints` if you need stricter or looser previews.
 
 ## Notes
 
