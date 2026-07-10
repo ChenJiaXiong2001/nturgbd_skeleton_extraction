@@ -1,7 +1,9 @@
 import argparse
 import importlib.util
 import json
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from .compat import patch_runtime
@@ -189,6 +191,9 @@ def infer_video(inferencer, video, args):
     num_kpts = 133
     visualizer = SkeletonVisualizer(video, args)
     kwargs = {"show": False, "return_vis": False, "draw_bbox": False, "kpt_thr": args.kpt_thr}
+    pose_batch_size = max(1, int(getattr(args, "pose_batch_size", 1) or 1))
+    if pose_batch_size > 1:
+        kwargs["batch_size"] = pose_batch_size
     try:
         for frame_idx, result in enumerate(inferencer(str(video), **kwargs)):
             items = select_instances(unwrap_predictions(result), args.bbox_thr, args.kpt_thr)
@@ -346,8 +351,64 @@ def build_inferencer(args):
     return require_mmpose()(**kwargs)
 
 
+def configure_cpu_threads(args):
+    threads = int(getattr(args, "cpu_threads", 0) or 0)
+    if threads <= 0:
+        return
+    value = str(threads)
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[name] = value
+    try:
+        import torch
+
+        torch.set_num_threads(threads)
+        try:
+            torch.set_num_interop_threads(max(1, min(threads, 4)))
+        except RuntimeError:
+            pass
+    except Exception:
+        pass
+    try:
+        import cv2
+
+        cv2.setNumThreads(threads)
+    except Exception:
+        pass
+    print("CPU threads per process: {}".format(threads), flush=True)
+
+
+def effective_workers(args, pending_count):
+    workers = max(1, int(getattr(args, "workers", 1) or 1))
+    workers = min(workers, max(1, pending_count))
+    if getattr(args, "show_skeleton", False) and workers > 1:
+        print("show-skeleton is interactive; using workers=1", flush=True)
+        return 1
+    return workers
+
+
+def split_jobs(jobs, workers):
+    chunks = [[] for _ in range(workers)]
+    for idx, job in enumerate(jobs):
+        chunks[idx % workers].append(job)
+    return [chunk for chunk in chunks if chunk]
+
+
+def run_worker(worker_id, jobs, args):
+    inferencer = build_inferencer(args)
+    outputs = []
+    for index, total, video, out in jobs:
+        video = Path(video)
+        out = Path(out)
+        print("[{}/{}] worker {} {}".format(index, total, worker_id, video), flush=True)
+        save_npz(out, video, infer_video(inferencer, video, args), args)
+        print("  saved {}".format(out), flush=True)
+        outputs.append(str(out))
+    return outputs
+
+
 def run(args):
     ensure_supported_python()
+    configure_cpu_threads(args)
     args.device = resolve_device(args.device)
     print("device {}".format(args.device), flush=True)
     if str(args.pose2d_weights) == str(RTMW_WEIGHTS_PATH):
@@ -361,18 +422,36 @@ def run(args):
         print("No videos found in {}".format(args.input), flush=True)
         return []
     print("RTMW extracting {} video(s)".format(len(videos)), flush=True)
-    inferencer = build_inferencer(args)
     outputs = []
+    jobs = []
     for i, video in enumerate(videos, 1):
         out = output_path(video, args.input, args.output)
         if args.skip_existing and out.exists():
             print("[{}/{}] skip {}".format(i, len(videos), out.name), flush=True)
             outputs.append(out)
             continue
-        print("[{}/{}] {}".format(i, len(videos), video), flush=True)
-        save_npz(out, video, infer_video(inferencer, video, args), args)
-        print("  saved {}".format(out), flush=True)
-        outputs.append(out)
+        jobs.append((i, len(videos), str(video), str(out)))
+    if not jobs:
+        return outputs
+
+    workers = effective_workers(args, len(jobs))
+    if workers == 1:
+        inferencer = build_inferencer(args)
+        for i, total, video, out in jobs:
+            video = Path(video)
+            out = Path(out)
+            print("[{}/{}] {}".format(i, total, video), flush=True)
+            save_npz(out, video, infer_video(inferencer, video, args), args)
+            print("  saved {}".format(out), flush=True)
+            outputs.append(out)
+        return outputs
+
+    print("parallel RTMW workers: {}".format(workers), flush=True)
+    chunks = split_jobs(jobs, workers)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(run_worker, idx + 1, chunk, args) for idx, chunk in enumerate(chunks)]
+        for future in as_completed(futures):
+            outputs.extend(Path(path) for path in future.result())
     return outputs
 
 
@@ -395,6 +474,9 @@ def parser():
     p.add_argument("--visualize-dir")
     p.add_argument("--skip-existing", action="store_true")
     p.add_argument("--limit", type=int)
+    p.add_argument("--cpu-threads", type=int, default=0, help="Limit CPU compute threads per process. Try 4 or 8 if CPU is pinned.")
+    p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size. Try 4 or 8 when CPU is saturated and GPU is underused.")
+    p.add_argument("--workers", type=int, default=1, help="Parallel video extraction workers. Try 2 first on one GPU.")
     return p
 
 

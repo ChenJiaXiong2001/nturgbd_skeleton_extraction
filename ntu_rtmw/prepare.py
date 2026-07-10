@@ -24,7 +24,7 @@ from .constants import (
 )
 from .download import ensure_rtmdet_weights, ensure_rtmw_weights
 from .device import resolve_device
-from .extract import RTMW_CONFIG, ensure_openmmlab_ready, run as extract_run
+from .extract import RTMW_CONFIG, configure_cpu_threads, ensure_openmmlab_ready, run as extract_run
 from .manifest import build_manifest
 
 
@@ -53,6 +53,9 @@ def parser():
     p.add_argument("--no-train", action="store_true")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--cpu-threads", type=int, default=0, help="Limit CPU compute threads per process. Try 4 or 8 if CPU is pinned.")
+    p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size. Try 4 or 8 when CPU is saturated and GPU is underused.")
+    p.add_argument("--workers", type=int, default=1, help="Parallel video extraction workers. Try 2 first on one GPU.")
     return p
 
 
@@ -75,6 +78,9 @@ def make_extract_args(args, input_dir, output_dir, weights_path, det_weights_pat
         visualize_dir=args.visualize_dir,
         skip_existing=args.skip_existing and not args.overwrite,
         limit=limit,
+        cpu_threads=args.cpu_threads,
+        pose_batch_size=args.pose_batch_size,
+        workers=args.workers,
     )
 
 
@@ -125,6 +131,7 @@ def extract_pose_archive_by_archive(args, weights_path, det_weights_path):
 def main():
     args = parser().parse_args()
     args.device = resolve_device(args.device)
+    configure_cpu_threads(args)
     print("device {}".format(args.device), flush=True)
     ensure_dirs(args.archives_dir, args.extract_dir, args.skeleton_dir, args.processed_dir, RUNS_DIR, MODELS_DIR)
     check_ntu_rgb_archives(args.archives_dir, require_all=args.require_all_archives)

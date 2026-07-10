@@ -130,6 +130,23 @@ Prepare data only:
 py -3.10 main.py --no-train
 ```
 
+When CPU is pinned but GPU use is low, keep one worker and try batching frames:
+
+```powershell
+py -3.10 main.py --no-train --pose-batch-size 4 --cpu-threads 8
+```
+
+Raise `--pose-batch-size` to `8` if VRAM is comfortable. Lower
+`--cpu-threads` to `4` if the machine feels overloaded. Use multiple extraction
+workers only when CPU still has headroom:
+
+```powershell
+py -3.10 main.py --no-train --workers 2
+```
+
+Each worker loads its own RTMDet and RTMW models, so CPU and GPU memory use both
+increase with the worker count.
+
 Show skeleton extraction live for one video:
 
 ```powershell
@@ -205,6 +222,18 @@ Process the standard NTU RGB video names ending in `_rgb.avi`:
 
 ```powershell
 py -3.10 -m ntu_rtmw.extract --input D:\datasets\nturgbd_rgb --output D:\datasets\ntu_rtmw_skeletons --device cuda:0
+```
+
+Run several videos in parallel:
+
+```powershell
+py -3.10 -m ntu_rtmw.extract --input D:\datasets\nturgbd_rgb --output D:\datasets\ntu_rtmw_skeletons --device cuda:0 --workers 2
+```
+
+If CPU is already saturated, prefer a single worker with batched inference:
+
+```powershell
+py -3.10 -m ntu_rtmw.extract --input D:\datasets\nturgbd_rgb --output D:\datasets\ntu_rtmw_skeletons --device cuda:0 --pose-batch-size 4 --cpu-threads 8
 ```
 
 Smoke test on one video:
