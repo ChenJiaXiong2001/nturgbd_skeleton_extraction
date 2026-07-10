@@ -50,6 +50,9 @@ def ensure_visualization(
     device="auto",
     cpu_threads=4,
     pose_batch_size=1,
+    temporal_min_frames=2,
+    temporal_max_jump=150.0,
+    temporal_min_keypoints=5,
 ):
     vis_video, vis_image = visualization_paths(video, vis_dir)
     if preview_is_ready(vis_video) and not regenerate:
@@ -73,9 +76,9 @@ def ensure_visualization(
         filter_output_to_bbox=True,
         output_bbox_margin=0.0,
         filter_output_to_frame=True,
-        temporal_min_frames=2,
-        temporal_max_jump=150.0,
-        temporal_min_keypoints=5,
+        temporal_min_frames=temporal_min_frames,
+        temporal_max_jump=temporal_max_jump,
+        temporal_min_keypoints=temporal_min_keypoints,
         show_skeleton=False,
         visualize_dir=str(vis_dir),
         skip_existing=False,
@@ -154,6 +157,9 @@ class PreviewBuildJob:
                 device=self.args.device,
                 cpu_threads=self.args.cpu_threads,
                 pose_batch_size=self.args.pose_batch_size,
+                temporal_min_frames=self.args.temporal_min_frames,
+                temporal_max_jump=self.args.temporal_max_jump,
+                temporal_min_keypoints=self.args.temporal_min_keypoints,
             )
         except Exception as exc:
             self.error = exc
@@ -305,6 +311,9 @@ def parser():
     p.add_argument("--device", default="auto", help="Device for preview generation. Default auto prefers cuda:0, then cpu.")
     p.add_argument("--cpu-threads", type=int, default=4, help="Limit CPU threads while generating a missing preview.")
     p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size while generating a missing preview.")
+    p.add_argument("--temporal-min-frames", type=int, default=2, help="Hide preview keypoints unless they survive this many consecutive frames.")
+    p.add_argument("--temporal-max-jump", type=float, default=150.0, help="Hide one-frame preview keypoint jumps larger than this many pixels.")
+    p.add_argument("--temporal-min-keypoints", type=int, default=5, help="Hide a preview person if fewer than this many body keypoints are visible.")
     p.add_argument("--regenerate", action="store_true")
     p.add_argument("--no-window", action="store_true", help="Only generate/check files, do not open OpenCV window.")
     p.add_argument("--speed", type=float, default=1.0)
@@ -337,6 +346,9 @@ def main():
             device=args.device,
             cpu_threads=args.cpu_threads,
             pose_batch_size=args.pose_batch_size,
+            temporal_min_frames=args.temporal_min_frames,
+            temporal_max_jump=args.temporal_max_jump,
+            temporal_min_keypoints=args.temporal_min_keypoints,
         )
         print("preview video: {}".format(vis_video.resolve()), flush=True)
         print("preview image: {}".format(vis_image.resolve()), flush=True)

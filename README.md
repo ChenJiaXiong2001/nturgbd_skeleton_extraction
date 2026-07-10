@@ -165,6 +165,7 @@ Open a small skeleton preview window:
 
 ```powershell
 py -3.10 preview.py
+py -3.10 preview.py --regenerate --temporal-min-frames 3 --temporal-min-keypoints 8
 ```
 
 If a preview has not been generated yet, this command builds it first. Preview
@@ -177,6 +178,8 @@ GPU.
 The preview window auto-plays the next video when one clip ends. It also has a
 `Next` button. You can press `n` for next, `p` for previous, and `q` or `Esc`
 to quit. Add `--loop-current` if you want one clip to replay instead.
+Use `--regenerate` after changing temporal cleanup settings, because existing
+preview `.avi` files already contain whatever skeletons were drawn earlier.
 
 Open realtime RTMW skeletons from a local camera:
 
