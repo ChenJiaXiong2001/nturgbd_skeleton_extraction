@@ -11,7 +11,7 @@ from ntu_rtmw.constants import (
     RTMW_WEIGHTS_PATH,
     SKELETON_DIR,
 )
-from ntu_rtmw.extract import run as extract_run
+from ntu_rtmw.extract import TemporalDisplayFilter, draw_skeleton, run as extract_run
 
 
 DEFAULT_VIS_DIR = Path("data") / "visualizations_preview"
@@ -37,9 +37,85 @@ def visualization_paths(video, vis_dir):
     return vis_dir / "{}_skeleton.avi".format(stem), vis_dir / "{}_skeleton.jpg".format(stem)
 
 
+def skeleton_candidates(video, out_dir):
+    video = Path(video).resolve()
+    out_dir = Path(out_dir)
+    candidates = [out_dir / "{}.npz".format(video.stem)]
+    try:
+        candidates.append(out_dir / video.relative_to(EXTRACTED_DIR.resolve()).with_suffix(".npz"))
+    except ValueError:
+        pass
+    seen = set()
+    unique = []
+    for candidate in candidates:
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def find_skeleton_path(video, out_dir):
+    for candidate in skeleton_candidates(video, out_dir):
+        if candidate.exists() and candidate.stat().st_size > 1024:
+            return candidate
+    matches = sorted(Path(out_dir).rglob("{}.npz".format(Path(video).stem)))
+    return matches[0] if matches else None
+
+
 def preview_is_ready(path):
     path = Path(path)
     return path.exists() and path.stat().st_size > 1024
+
+
+def ensure_skeleton(
+    video,
+    out_dir,
+    regenerate=False,
+    device="auto",
+    cpu_threads=4,
+    pose_batch_size=1,
+    temporal_min_frames=2,
+    temporal_max_jump=150.0,
+    temporal_min_keypoints=5,
+):
+    skeleton_path = find_skeleton_path(video, out_dir)
+    if skeleton_path is not None and not regenerate:
+        print("skeleton ready: {}".format(skeleton_path), flush=True)
+        return skeleton_path
+
+    extract_run(Namespace(
+        input=str(video),
+        output=str(out_dir),
+        pattern="*_rgb.avi",
+        all_videos=False,
+        pose2d_weights=str(RTMW_WEIGHTS_PATH),
+        pose2d=RTMW_CONFIG,
+        det_model=RTMDET_CONFIG,
+        det_weights=str(RTMDET_WEIGHTS_PATH),
+        device=device,
+        max_persons=2,
+        bbox_thr=0.3,
+        kpt_thr=0.1,
+        tracking_distance=150.0,
+        filter_output_to_bbox=True,
+        output_bbox_margin=0.0,
+        filter_output_to_frame=True,
+        temporal_min_frames=temporal_min_frames,
+        temporal_max_jump=temporal_max_jump,
+        temporal_min_keypoints=temporal_min_keypoints,
+        show_skeleton=False,
+        visualize_dir=None,
+        skip_existing=False,
+        limit=None,
+        cpu_threads=cpu_threads,
+        pose_batch_size=pose_batch_size,
+        workers=1,
+    ))
+    skeleton_path = find_skeleton_path(video, out_dir)
+    if skeleton_path is None:
+        raise SystemExit("Skeleton file was not generated for: {}".format(video))
+    return skeleton_path
 
 
 def ensure_visualization(
@@ -88,6 +164,24 @@ def ensure_visualization(
         workers=1,
     ))
     return vis_video, vis_image
+
+
+def load_skeleton_arrays(path):
+    import numpy as np
+
+    data = np.load(str(path), allow_pickle=False)
+    keypoints = data["keypoints"]
+    scores = data["scores"]
+    bboxes = data["bboxes"] if "bboxes" in data else np.full(keypoints.shape[:2] + (4,), np.nan, dtype=np.float32)
+    bbox_scores = data["bbox_scores"] if "bbox_scores" in data else np.zeros(keypoints.shape[:2], dtype=np.float32)
+    frame_indices = data["frame_indices"] if "frame_indices" in data else np.arange(keypoints.shape[0], dtype=np.int32)
+    return {
+        "keypoints": keypoints,
+        "scores": scores,
+        "bboxes": bboxes,
+        "bbox_scores": bbox_scores,
+        "frame_indices": frame_indices,
+    }
 
 
 def resize_for_preview(frame, max_width, max_height):
@@ -149,18 +243,31 @@ class PreviewBuildJob:
 
     def _run(self):
         try:
-            self.result = ensure_visualization(
-                video=self.video,
-                out_dir=self.args.out_dir,
-                vis_dir=self.args.vis_dir,
-                regenerate=self.args.regenerate,
-                device=self.args.device,
-                cpu_threads=self.args.cpu_threads,
-                pose_batch_size=self.args.pose_batch_size,
-                temporal_min_frames=self.args.temporal_min_frames,
-                temporal_max_jump=self.args.temporal_max_jump,
-                temporal_min_keypoints=self.args.temporal_min_keypoints,
-            )
+            if self.args.direct:
+                self.result = ensure_skeleton(
+                    video=self.video,
+                    out_dir=self.args.out_dir,
+                    regenerate=self.args.regenerate,
+                    device=self.args.device,
+                    cpu_threads=self.args.cpu_threads,
+                    pose_batch_size=self.args.pose_batch_size,
+                    temporal_min_frames=self.args.temporal_min_frames,
+                    temporal_max_jump=self.args.temporal_max_jump,
+                    temporal_min_keypoints=self.args.temporal_min_keypoints,
+                )
+            else:
+                self.result = ensure_visualization(
+                    video=self.video,
+                    out_dir=self.args.out_dir,
+                    vis_dir=self.args.vis_dir,
+                    regenerate=self.args.regenerate,
+                    device=self.args.device,
+                    cpu_threads=self.args.cpu_threads,
+                    pose_batch_size=self.args.pose_batch_size,
+                    temporal_min_frames=self.args.temporal_min_frames,
+                    temporal_max_jump=self.args.temporal_max_jump,
+                    temporal_min_keypoints=self.args.temporal_min_keypoints,
+                )
         except Exception as exc:
             self.error = exc
         finally:
@@ -186,12 +293,19 @@ def draw_loading(frame, message, detail):
 
 
 def wait_for_preview(video, args, cv2, window, state, last_frame):
+    if args.direct:
+        skeleton_path = find_skeleton_path(video, args.out_dir)
+        if skeleton_path is not None and not args.regenerate:
+            print("skeleton ready: {}".format(skeleton_path), flush=True)
+            return skeleton_path
+
     vis_video, vis_image = visualization_paths(video, args.vis_dir)
-    if preview_is_ready(vis_video) and not args.regenerate:
+    if not args.direct and preview_is_ready(vis_video) and not args.regenerate:
         print("preview ready: {}".format(vis_video), flush=True)
         return vis_video, vis_image
 
-    print("building preview in background: {}".format(video), flush=True)
+    action = "building skeleton in background" if args.direct else "building preview in background"
+    print("{}: {}".format(action, video), flush=True)
     state.button_rect = None
     job = PreviewBuildJob(video, args).start()
     while not job.done:
@@ -207,6 +321,67 @@ def wait_for_preview(video, args, cv2, window, state, last_frame):
     if job.error:
         raise SystemExit("Failed to build preview for {}: {}".format(video, job.error))
     return job.result
+
+
+def draw_direct_frame(frame, arrays, array_idx, args, display_filter, cv2):
+    if array_idx < 0 or array_idx >= arrays["keypoints"].shape[0]:
+        return frame
+    keypoints = arrays["keypoints"][array_idx]
+    scores = arrays["scores"][array_idx]
+    bboxes = arrays["bboxes"][array_idx]
+    bbox_scores = arrays["bbox_scores"][array_idx]
+    if args.direct_temporal_display:
+        keypoints, scores, bboxes, bbox_scores = display_filter.apply_arrays(keypoints, scores, bboxes, bbox_scores)
+    draw_skeleton(frame, keypoints, scores, bboxes, bbox_scores, args.kpt_thr, cv2)
+    return frame
+
+
+def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        raise SystemExit("Cannot open video: {}".format(video))
+    arrays = load_skeleton_arrays(skeleton_path)
+    frame_to_array = {int(frame_idx): idx for idx, frame_idx in enumerate(arrays["frame_indices"])}
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    delay = max(1, int(1000 / max(1, fps * args.speed)))
+    display_filter = TemporalDisplayFilter(
+        args.temporal_min_frames,
+        args.temporal_max_jump,
+        args.temporal_min_keypoints,
+        args.kpt_thr,
+    )
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            cap.release()
+            return "ended"
+        array_idx = frame_to_array.get(frame_idx, frame_idx)
+        frame = draw_direct_frame(frame, arrays, array_idx, args, display_filter, cv2)
+        frame = resize_for_preview(frame, args.max_width, args.max_height)
+        state.button_rect = draw_controls(
+            frame,
+            Path(video).name,
+            index,
+            total,
+            auto_play=not args.loop_current,
+        )
+        cv2.imshow("NTU RTMW skeleton preview", frame)
+        key = cv2.waitKey(delay) & 0xFF
+        if key in (ord("q"), 27):
+            cap.release()
+            return "quit"
+        if key in (ord("n"), ord("d")):
+            cap.release()
+            return "next"
+        if key in (ord("p"), ord("a")):
+            cap.release()
+            return "previous"
+        if state.next_requested:
+            state.next_requested = False
+            cap.release()
+            return "next"
+        frame_idx += 1
 
 
 def play_playlist(videos, start_index, args):
@@ -230,6 +405,19 @@ def play_playlist(videos, start_index, args):
         if preview is None:
             cv2.destroyAllWindows()
             return
+        if args.direct:
+            result = play_direct_video(video, preview, args, cv2, state, index, len(videos))
+            if result == "quit":
+                cv2.destroyAllWindows()
+                return
+            if result == "previous":
+                index = (index - 1) % len(videos)
+            else:
+                if args.loop_current and result == "ended":
+                    continue
+                index = (index + 1) % len(videos)
+            continue
+
         vis_video, vis_image = preview
         print("playing: {}".format(vis_video.resolve()), flush=True)
 
@@ -303,6 +491,21 @@ def play_video(path, speed=1.0, max_width=DEFAULT_MAX_WIDTH, max_height=DEFAULT_
     cv2.destroyAllWindows()
 
 
+def play_direct_single(video, skeleton_path, args):
+    import cv2
+
+    state = PreviewState()
+    window = "NTU RTMW skeleton preview"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window, args.max_width, args.max_height)
+    while True:
+        result = play_direct_video(video, skeleton_path, args, cv2, state)
+        if result != "ended" or not args.loop_current:
+            break
+    if result != "quit":
+        cv2.destroyAllWindows()
+
+
 def parser():
     p = argparse.ArgumentParser(description="Generate and play one RTMW skeleton preview.")
     p.add_argument("--video", help="Specific NTU *_rgb.avi file. Defaults to the first extracted video.")
@@ -311,6 +514,9 @@ def parser():
     p.add_argument("--device", default="auto", help="Device for preview generation. Default auto prefers cuda:0, then cpu.")
     p.add_argument("--cpu-threads", type=int, default=4, help="Limit CPU threads while generating a missing preview.")
     p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size while generating a missing preview.")
+    p.add_argument("--direct", action="store_true", help="Draw skeletons directly from .npz on the original video instead of generating a fused preview .avi.")
+    p.add_argument("--direct-temporal-display", action=argparse.BooleanOptionalAction, default=True, help="Apply temporal display filtering while drawing direct previews.")
+    p.add_argument("--kpt-thr", type=float, default=0.1, help="Keypoint score threshold used while drawing direct previews.")
     p.add_argument("--temporal-min-frames", type=int, default=2, help="Hide preview keypoints unless they survive this many consecutive frames.")
     p.add_argument("--temporal-max-jump", type=float, default=150.0, help="Hide one-frame preview keypoint jumps larger than this many pixels.")
     p.add_argument("--temporal-min-keypoints", type=int, default=5, help="Hide a preview person if fewer than this many body keypoints are visible.")
@@ -338,20 +544,34 @@ def main():
         start_index = 0
     video = videos[start_index]
     if args.no_window:
-        vis_video, vis_image = ensure_visualization(
-            video=video,
-            out_dir=args.out_dir,
-            vis_dir=args.vis_dir,
-            regenerate=args.regenerate,
-            device=args.device,
-            cpu_threads=args.cpu_threads,
-            pose_batch_size=args.pose_batch_size,
-            temporal_min_frames=args.temporal_min_frames,
-            temporal_max_jump=args.temporal_max_jump,
-            temporal_min_keypoints=args.temporal_min_keypoints,
-        )
-        print("preview video: {}".format(vis_video.resolve()), flush=True)
-        print("preview image: {}".format(vis_image.resolve()), flush=True)
+        if args.direct:
+            skeleton_path = ensure_skeleton(
+                video=video,
+                out_dir=args.out_dir,
+                regenerate=args.regenerate,
+                device=args.device,
+                cpu_threads=args.cpu_threads,
+                pose_batch_size=args.pose_batch_size,
+                temporal_min_frames=args.temporal_min_frames,
+                temporal_max_jump=args.temporal_max_jump,
+                temporal_min_keypoints=args.temporal_min_keypoints,
+            )
+            print("skeleton file: {}".format(skeleton_path.resolve()), flush=True)
+        else:
+            vis_video, vis_image = ensure_visualization(
+                video=video,
+                out_dir=args.out_dir,
+                vis_dir=args.vis_dir,
+                regenerate=args.regenerate,
+                device=args.device,
+                cpu_threads=args.cpu_threads,
+                pose_batch_size=args.pose_batch_size,
+                temporal_min_frames=args.temporal_min_frames,
+                temporal_max_jump=args.temporal_max_jump,
+                temporal_min_keypoints=args.temporal_min_keypoints,
+            )
+            print("preview video: {}".format(vis_video.resolve()), flush=True)
+            print("preview image: {}".format(vis_image.resolve()), flush=True)
     else:
         play_playlist(videos, start_index, args)
 
