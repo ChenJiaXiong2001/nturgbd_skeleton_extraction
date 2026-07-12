@@ -512,6 +512,7 @@ def draw_controls(
     controls = {}
     buttons = [
         ("previous", "Prev", 82),
+        ("select", "Select", 88),
         ("pause", "Play" if paused else "Pause", 88),
         ("replay", "Replay", 92),
         ("slower", "-Speed", 92),
@@ -567,6 +568,55 @@ def point_in_rect(x, y, rect):
     return x1 <= x <= x2 and y1 <= y <= y2
 
 
+def choose_video_index(videos, current_index):
+    """Show a small native picker and return the chosen playlist index."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except ImportError:
+        return current_index
+    result = [current_index]
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        return current_index
+    root.title("Select NTU preview video")
+    root.geometry("760x520")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(1, weight=1)
+    query = tk.StringVar()
+    top = ttk.Frame(root)
+    top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 4))
+    ttk.Label(top, text="Type to filter, then double-click a video:").pack(side="left")
+    ttk.Entry(top, textvariable=query, width=42).pack(side="right", fill="x", expand=True, padx=(12, 0))
+    box = tk.Listbox(root, activestyle="dotbox")
+    box.grid(row=1, column=0, sticky="nsew", padx=10, pady=4)
+    scroll = ttk.Scrollbar(root, orient="vertical", command=box.yview)
+    scroll.grid(row=1, column=1, sticky="ns", pady=4)
+    box.configure(yscrollcommand=scroll.set)
+    shown = []
+
+    def refresh(*_):
+        needle = query.get().strip().lower()
+        shown[:] = [(idx, video_label(item)) for idx, item in enumerate(videos) if not needle or needle in video_name(item).lower() or needle in video_label(item).lower()]
+        box.delete(0, tk.END)
+        for idx, label in shown:
+            box.insert(tk.END, "{:4d}  {}".format(idx + 1, label))
+
+    def accept(*_):
+        selected = box.curselection()
+        if selected:
+            result[0] = shown[selected[0]][0]
+            root.destroy()
+
+    query.trace_add("write", refresh)
+    box.bind("<Double-Button-1>", accept)
+    ttk.Button(root, text="Open", command=accept).grid(row=2, column=0, sticky="e", padx=10, pady=10)
+    refresh()
+    root.mainloop()
+    return result[0]
+
+
 class PreviewState:
     def __init__(self):
         self.next_requested = False
@@ -575,6 +625,7 @@ class PreviewState:
         self.replay_requested = False
         self.speed_delta = 0
         self.seek_ratio = None
+        self.select_requested = False
         self.controls = {}
 
     def reset_requests(self):
@@ -584,6 +635,7 @@ class PreviewState:
         self.replay_requested = False
         self.speed_delta = 0
         self.seek_ratio = None
+        self.select_requested = False
 
 
 class PreviewBuildJob:
@@ -755,6 +807,9 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1, 
         if key in (ord("p"), ord("a")):
             cap.release()
             return "previous"
+        if key == ord("g"):
+            cap.release()
+            return "select"
         if key == ord(" "):
             paused = not paused
         if key == ord("r"):
@@ -771,6 +826,10 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1, 
             state.next_requested = False
             cap.release()
             return "next"
+        if state.select_requested:
+            state.select_requested = False
+            cap.release()
+            return "select"
         if state.pause_requested:
             state.pause_requested = False
             paused = not paused
@@ -819,6 +878,8 @@ def play_playlist(videos, start_index, args, cache):
                 state.previous_requested = True
             elif action == "next":
                 state.next_requested = True
+            elif action == "select":
+                state.select_requested = True
             elif action == "pause":
                 state.pause_requested = True
             elif action == "replay":
@@ -866,6 +927,9 @@ def play_playlist(videos, start_index, args, cache):
             if result == "quit":
                 cv2.destroyAllWindows()
                 return
+            if result == "select":
+                index = choose_video_index(videos, index)
+                continue
             if result == "previous":
                 index = (index - 1) % len(videos)
             else:
@@ -889,6 +953,7 @@ def play_playlist(videos, start_index, args, cache):
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         frame_idx = 0
         playback_frame = None
+        select_after = False
         while True:
             if not paused or playback_frame is None:
                 ok, frame = cap.read()
@@ -930,6 +995,9 @@ def play_playlist(videos, start_index, args, cache):
                 state.previous_requested = False
                 state.next_requested = False
                 break
+            if key == ord("g"):
+                select_after = True
+                break
             if key == ord(" "):
                 paused = not paused
             if key == ord("r"):
@@ -948,6 +1016,10 @@ def play_playlist(videos, start_index, args, cache):
                 state.previous_requested = False
                 state.next_requested = False
                 break
+            if state.select_requested:
+                state.select_requested = False
+                select_after = True
+                break
             if state.pause_requested:
                 state.pause_requested = False
                 paused = not paused
@@ -965,6 +1037,8 @@ def play_playlist(videos, start_index, args, cache):
             elif not paused:
                 frame_idx += 1
         cap.release()
+        if select_after:
+            index = choose_video_index(videos, index)
 
 
 def play_video(path, speed=1.0, max_width=DEFAULT_MAX_WIDTH, max_height=DEFAULT_MAX_HEIGHT):

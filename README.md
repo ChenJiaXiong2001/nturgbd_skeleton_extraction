@@ -187,9 +187,10 @@ cache, preloads the next AVI in the background, and removes old cached AVIs as
 you move through the playlist. Use `--no-preload` to keep only the current AVI.
 
 The preview window auto-plays the next video when one clip ends. Its controls
-provide previous/next, pause/play, replay, speed adjustment, and a clickable
-seek bar. Keyboard shortcuts are `n`/`p`, Space, `r`, `-`/`+`, and `q` or
-`Esc`. Add `--loop-current` if you want one clip to replay instead.
+provide previous/next, a searchable `Select` file picker, pause/play, replay,
+speed adjustment, and a clickable seek bar. Keyboard shortcuts are `n`/`p`,
+`g` (select), Space, `r`, `-`/`+`, and `q` or `Esc`. Add `--loop-current` if
+you want one clip to replay instead.
 Use `--list` to print numbered videos, then `--index N` to start previewing
 from the Nth video.
 For close two-person interactions, direct preview keeps person slots stable
