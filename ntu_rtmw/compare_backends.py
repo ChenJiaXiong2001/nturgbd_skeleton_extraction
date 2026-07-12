@@ -257,24 +257,44 @@ def mean(values):
 
 
 def summarize(outputs, kpt_thr):
+    import numpy as np
+
     valid_counts = []
+    body_valid_counts = []
     bbox_scores = []
     persons = []
     times = []
     filtered_counts = []
-    for _, out in outputs:
+    fewer_than_two = []
+    for frame_idx, out in outputs:
         points, _ = finite_valid_points(out, kpt_thr)
         valid_counts.append(len(points))
         bbox_scores.append(float(out["bbox_scores"][0]))
-        persons.append(int(out["count"]))
+        person_count = int(out["count"])
+        persons.append(person_count)
+        if person_count < 2:
+            fewer_than_two.append(frame_idx)
+        for person_idx in range(person_count):
+            person_points = out["keypoints"][person_idx]
+            person_scores = out["scores"][person_idx]
+            valid = (person_scores >= kpt_thr) & np.isfinite(person_points).all(axis=1)
+            body_valid_counts.append(int(valid[:17].sum()))
         times.append(float(out["elapsed"]))
         filtered_counts.append(int(out.get("filtered_keypoints", 0)))
     return {
         "frames": len(outputs),
         "detected_frames": sum(1 for x in bbox_scores if x > 0),
+        "frames_with_two_people": sum(count >= 2 for count in persons),
+        "two_person_recall": sum(count >= 2 for count in persons) / len(persons),
+        "frames_with_fewer_than_two_people": fewer_than_two,
         "avg_ms_per_frame": mean(times) * 1000 if times else None,
         "avg_persons": mean(persons),
         "avg_valid_keypoints_person0": mean(valid_counts),
+        "avg_valid_body_keypoints_per_detected_person": mean(body_valid_counts),
+        "body_complete_rate_15_of_17": (
+            sum(count >= 15 for count in body_valid_counts) / len(body_valid_counts)
+            if body_valid_counts else None
+        ),
         "avg_bbox_score_person0": mean(bbox_scores),
         "avg_filtered_keypoints": mean(filtered_counts),
     }
@@ -308,7 +328,7 @@ def draw_label(frame, label, cv2):
     cv2.putText(frame, label, (18, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def make_visuals(frames, outputs_by_variant, out_dir, kpt_thr, make_video):
+def make_visuals(frames, outputs_by_variant, variants, out_dir, kpt_thr, make_video):
     import cv2
     import numpy as np
 
@@ -316,20 +336,28 @@ def make_visuals(frames, outputs_by_variant, out_dir, kpt_thr, make_video):
     out_dir.mkdir(parents=True, exist_ok=True)
     writer = None
     first_image = None
+    merged_frames = []
     for i, (frame_idx, frame) in enumerate(frames):
         tiles = []
-        for variant_name, label in VARIANTS:
+        for variant_name, label in variants:
             tile = frame.copy()
             out = outputs_by_variant[variant_name][i][1]
             draw_skeleton(tile, out["keypoints"], out["scores"], out["bboxes"], out["bbox_scores"], kpt_thr, cv2)
             draw_label(tile, "{}  frame {}".format(label, frame_idx), cv2)
             tiles.append(tile)
-        top = np.concatenate(tiles[:2], axis=1)
-        bottom = np.concatenate(tiles[2:], axis=1)
-        merged = np.concatenate([top, bottom], axis=0)
+        if len(tiles) == 1:
+            merged = tiles[0]
+        elif len(tiles) == 2:
+            merged = np.concatenate(tiles, axis=1)
+        else:
+            if len(tiles) % 2:
+                tiles.append(np.zeros_like(tiles[0]))
+            rows = [np.concatenate(tiles[row:row + 2], axis=1) for row in range(0, len(tiles), 2)]
+            merged = np.concatenate(rows, axis=0)
         scale = min(1800 / merged.shape[1], 1200 / merged.shape[0], 1.0)
         if scale < 1:
             merged = cv2.resize(merged, (int(merged.shape[1] * scale), int(merged.shape[0] * scale)))
+        merged_frames.append(merged)
         if i == 0:
             first_image = out_dir / "comparison_first_frame.jpg"
             cv2.imwrite(str(first_image), merged)
@@ -344,6 +372,21 @@ def make_visuals(frames, outputs_by_variant, out_dir, kpt_thr, make_video):
             writer.write(merged)
     if writer is not None:
         writer.release()
+    if merged_frames:
+        stage_indices = sorted(set([
+            0,
+            len(merged_frames) // 4,
+            len(merged_frames) // 2,
+            3 * len(merged_frames) // 4,
+            len(merged_frames) - 1,
+        ]))
+        stage_images = [merged_frames[idx] for idx in stage_indices]
+        width = max(image.shape[1] for image in stage_images)
+        padded = [
+            cv2.copyMakeBorder(image, 0, 0, 0, width - image.shape[1], cv2.BORDER_CONSTANT)
+            for image in stage_images
+        ]
+        cv2.imwrite(str(out_dir / "comparison_key_stages.jpg"), np.concatenate(padded, axis=0))
     return first_image
 
 
@@ -365,6 +408,13 @@ def parser():
     p.add_argument("--filter-output-to-bbox", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--output-bbox-margin", type=float, default=0.0)
     p.add_argument("--reference", choices=[name for name, _ in VARIANTS], default="rtmdet_frame")
+    p.add_argument(
+        "--variants",
+        nargs="+",
+        choices=[name for name, _ in VARIANTS],
+        default=[name for name, _ in VARIANTS],
+        help="Variants to run. Use 'yolo_frame yolo_crop' for a focused YOLO-box + RTMW comparison.",
+    )
     p.add_argument("--video-preview", action="store_true")
     return p
 
@@ -378,8 +428,12 @@ def main():
 
     print("video: {}".format(video), flush=True)
     print("frames: {} stride: {}".format(len(frames), args.stride), flush=True)
+    selected_variants = [(name, label) for name, label in VARIANTS if name in args.variants]
+    if not selected_variants:
+        raise SystemExit("No comparison variants selected")
+    reference = args.reference if args.reference in args.variants else selected_variants[0][0]
     outputs_by_variant = {}
-    for variant_name, label in VARIANTS:
+    for variant_name, label in selected_variants:
         print("running {}...".format(label), flush=True)
         outputs_by_variant[variant_name] = infer_variant(frames, variant_name, args)
 
@@ -387,15 +441,15 @@ def main():
         "video": str(video),
         "frames": len(frames),
         "stride": args.stride,
-        "reference": args.reference,
+        "reference": reference,
         "variants": {
             name: summarize(outputs, args.kpt_thr)
             for name, outputs in outputs_by_variant.items()
         },
         "against_reference": {
-            name: compare_outputs(outputs_by_variant[args.reference], outputs, args.kpt_thr)
+            name: compare_outputs(outputs_by_variant[reference], outputs, args.kpt_thr)
             for name, outputs in outputs_by_variant.items()
-            if name != args.reference
+            if name != reference
         },
     }
 
@@ -403,12 +457,15 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "comparison_report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    image_path = make_visuals(frames, outputs_by_variant, out_dir, args.kpt_thr, args.video_preview)
+    image_path = make_visuals(
+        frames, outputs_by_variant, selected_variants, out_dir, args.kpt_thr, args.video_preview
+    )
 
     print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     print("report: {}".format(report_path.resolve()), flush=True)
     if image_path:
         print("image: {}".format(image_path.resolve()), flush=True)
+        print("key stages: {}".format((out_dir / "comparison_key_stages.jpg").resolve()), flush=True)
 
 
 if __name__ == "__main__":

@@ -181,10 +181,15 @@ default so opening a preview does not take over the whole machine. Use
 `--cpu-threads 2` for a lighter preview build, or `--device cuda:0` to force a
 GPU.
 
-The preview window auto-plays the next video when one clip ends. It also has
-`Prev` and `Next` buttons. You can press `n` for next, `p` for previous, and
-`q` or `Esc` to quit. Add `--loop-current` if you want one clip to replay
-instead.
+The preview playlist includes videos inside `data/raw_archives/*.zip`; it does
+not expand a whole archive. It copies only the selected AVI into a temporary
+cache, preloads the next AVI in the background, and removes old cached AVIs as
+you move through the playlist. Use `--no-preload` to keep only the current AVI.
+
+The preview window auto-plays the next video when one clip ends. Its controls
+provide previous/next, pause/play, replay, speed adjustment, and a clickable
+seek bar. Keyboard shortcuts are `n`/`p`, Space, `r`, `-`/`+`, and `q` or
+`Esc`. Add `--loop-current` if you want one clip to replay instead.
 Use `--list` to print numbered videos, then `--index N` to start previewing
 from the Nth video.
 For close two-person interactions, direct preview keeps person slots stable
@@ -200,6 +205,25 @@ Open realtime RTMW skeletons from a local camera:
 ```powershell
 py -3.10 camera.py
 ```
+
+Compare YOLO and RTMDet person boxes while keeping the downstream pose path
+fixed to explicit person crops and RTMW-L:
+
+```powershell
+py -3.10 compare_backends.py `
+  --video data\extracted\s001\nturgb+d_rgb\S001C001P001R001A055_rgb.avi `
+  --output-dir data\comparisons\A055_yolo_vs_rtmdet_rtmw_crop_all_frames `
+  --frames 95 --stride 1 `
+  --variants rtmdet_crop yolo_crop --reference rtmdet_crop --video-preview
+```
+
+Both variants use the same crop and RTMW-L pose inference code. The only
+changed variable is whether person boxes come from `models/yolov8n.pt` or the
+RTMDet detector used by the standard OpenMMLab pipeline.
+The comparison command supports striding for quick diagnostics, but skeleton
+files used for training are produced by the main extraction pipeline without
+frame sampling. Missing detections remain as zero/NaN entries at their original
+frame positions rather than shortening the sequence.
 
 The camera path uses YOLOv8n for person boxes by default, then sends those
 boxes to RTMW for whole-body keypoints. The YOLO checkpoint is kept at:

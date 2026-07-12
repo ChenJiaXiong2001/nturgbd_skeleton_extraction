@@ -1,10 +1,15 @@
 import argparse
+import shutil
+import tempfile
 import threading
+import zipfile
 from argparse import Namespace
+from dataclasses import dataclass
 from pathlib import Path
 
 from ntu_rtmw.constants import (
     EXTRACTED_DIR,
+    RAW_ARCHIVES_DIR,
     RTMDET_CONFIG,
     RTMDET_WEIGHTS_PATH,
     RTMW_CONFIG,
@@ -19,20 +24,156 @@ DEFAULT_MAX_WIDTH = 960
 DEFAULT_MAX_HEIGHT = 540
 
 
+@dataclass(frozen=True)
+class ArchiveVideo:
+    archive: Path
+    member: str
+
+    @property
+    def name(self):
+        return Path(self.member).name
+
+    @property
+    def stem(self):
+        return Path(self.member).stem
+
+    def __str__(self):
+        return "{}::{}".format(self.archive, self.member)
+
+
+def video_name(video):
+    return video.name if isinstance(video, ArchiveVideo) else Path(video).name
+
+
+def video_stem(video):
+    return video.stem if isinstance(video, ArchiveVideo) else Path(video).stem
+
+
+def video_label(video):
+    if isinstance(video, ArchiveVideo):
+        return "{} / {}".format(video.archive.name, video.name)
+    return str(Path(video))
+
+
+class ArchiveVideoCache:
+    """Materialize only selected ZIP members and preload one upcoming video."""
+
+    def __init__(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="ntu_preview_")
+        self.root = Path(self._temp.name)
+        self._paths = {}
+        self._jobs = {}
+        self._errors = {}
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def _target(self, source):
+        archive_tag = source.archive.stem.replace(".", "_")
+        return self.root / archive_tag / source.name
+
+    def _extract(self, source):
+        target = self._target(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_suffix(target.suffix + ".part")
+        try:
+            with zipfile.ZipFile(source.archive) as zf, zf.open(source.member) as src, partial.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=4 * 1024 * 1024)
+            partial.replace(target)
+            with self._lock:
+                if not self._closed:
+                    self._paths[source] = target
+        except Exception as exc:
+            with self._lock:
+                self._errors[source] = exc
+            try:
+                partial.unlink()
+            except FileNotFoundError:
+                pass
+
+    def preload(self, source):
+        if not isinstance(source, ArchiveVideo):
+            return
+        with self._lock:
+            existing = self._jobs.get(source)
+            if source in self._paths or (existing is not None and existing.is_alive()) or self._closed:
+                return
+            job = threading.Thread(target=self._extract, args=(source,), daemon=True)
+            self._jobs[source] = job
+            job.start()
+
+    def materialize(self, source, progress=None):
+        if not isinstance(source, ArchiveVideo):
+            return Path(source)
+        self.preload(source)
+        with self._lock:
+            job = self._jobs[source]
+        while job.is_alive():
+            job.join(0.05)
+            if progress:
+                progress(source)
+        with self._lock:
+            error = self._errors.pop(source, None)
+            path = self._paths.get(source)
+        if error:
+            raise SystemExit("Failed to read {}: {}".format(source, error))
+        if path is None:
+            raise SystemExit("Archive member was not materialized: {}".format(source))
+        return path
+
+    def retain(self, sources):
+        keep = {source for source in sources if isinstance(source, ArchiveVideo)}
+        with self._lock:
+            stale = [(source, path) for source, path in self._paths.items() if source not in keep]
+            for source, _ in stale:
+                self._paths.pop(source, None)
+        for _, path in stale:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            job.join()
+        self._temp.cleanup()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
 def find_first_video(root):
     return list_videos(root)[0]
 
 
-def list_videos(root):
+def list_videos(root, archives_dir=RAW_ARCHIVES_DIR):
     root = Path(root)
-    videos = sorted(root.rglob("*_rgb.avi"))
+    extracted = sorted(root.rglob("*_rgb.avi")) if root.exists() else []
+    by_name = {path.name.lower(): path for path in extracted}
+    archives_dir = Path(archives_dir)
+    if archives_dir.exists():
+        for archive in sorted(archives_dir.glob("*.zip")):
+            try:
+                with zipfile.ZipFile(archive) as zf:
+                    for member in zf.namelist():
+                        name = Path(member).name
+                        if name.lower().endswith("_rgb.avi"):
+                            by_name.setdefault(name.lower(), ArchiveVideo(archive, member))
+            except zipfile.BadZipFile as exc:
+                print("skip bad ZIP {}: {}".format(archive, exc), flush=True)
+    videos = sorted(by_name.values(), key=lambda item: video_name(item).lower())
     if not videos:
-        raise SystemExit("No NTU RGB video found under: {}".format(root))
+        raise SystemExit("No NTU RGB video found under {} or {}".format(root, archives_dir))
     return videos
 
 
 def visualization_paths(video, vis_dir):
-    stem = Path(video).stem
+    stem = video_stem(video)
     vis_dir = Path(vis_dir)
     return vis_dir / "{}_skeleton.avi".format(stem), vis_dir / "{}_skeleton.jpg".format(stem)
 
@@ -349,34 +490,76 @@ def resize_for_preview(frame, max_width, max_height):
     return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
 
 
-def draw_controls(frame, label, index, total, auto_play=True):
+def _format_time(seconds):
+    seconds = max(0, int(seconds or 0))
+    return "{:02d}:{:02d}".format(seconds // 60, seconds % 60)
+
+
+def draw_controls(
+    frame,
+    label,
+    index,
+    total,
+    auto_play=True,
+    paused=False,
+    speed=1.0,
+    position=0,
+    duration=0,
+):
     import cv2
 
-    button_w, button_h = 112, 42
-    margin = 14
-    gap = 10
-    next_x1 = frame.shape[1] - button_w - margin
-    y1 = margin
-    next_x2 = frame.shape[1] - margin
-    y2 = y1 + button_h
-    prev_x1 = max(margin, next_x1 - button_w - gap)
-    prev_x2 = prev_x1 + button_w
-    prev_rect = (prev_x1, y1, prev_x2, y2)
-    next_rect = (next_x1, y1, next_x2, y2)
+    height, width = frame.shape[:2]
+    controls = {}
+    buttons = [
+        ("previous", "Prev", 82),
+        ("pause", "Play" if paused else "Pause", 88),
+        ("replay", "Replay", 92),
+        ("slower", "-Speed", 92),
+        ("faster", "+Speed", 92),
+        ("next", "Next", 82),
+    ]
+    gap, button_h = 8, 38
+    total_width = sum(item[2] for item in buttons) + gap * (len(buttons) - 1)
+    x = max(10, (width - total_width) // 2)
+    y = 10
+    for action, text, button_w in buttons:
+        rect = (x, y, min(width - 4, x + button_w), y + button_h)
+        controls[action] = rect
+        color = (30, 120, 30) if action == "next" else (65, 65, 65)
+        cv2.rectangle(frame, rect[:2], rect[2:], color, -1)
+        cv2.rectangle(frame, rect[:2], rect[2:], (210, 210, 210), 1)
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0]
+        text_x = rect[0] + max(4, (rect[2] - rect[0] - text_size[0]) // 2)
+        cv2.putText(frame, text, (text_x, y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        x += button_w + gap
 
-    cv2.rectangle(frame, (prev_x1, y1), (prev_x2, y2), (90, 90, 90), -1)
-    cv2.rectangle(frame, (prev_x1, y1), (prev_x2, y2), (210, 210, 210), 2)
-    cv2.putText(frame, "Prev", (prev_x1 + 23, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+    panel_top = max(0, height - 67)
+    cv2.rectangle(frame, (0, panel_top), (width, height), (0, 0, 0), -1)
+    bar_x1, bar_x2 = 18, max(19, width - 18)
+    bar_y1, bar_y2 = panel_top + 10, panel_top + 22
+    controls["progress"] = (bar_x1, bar_y1, bar_x2, bar_y2)
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), (80, 80, 80), -1)
+    ratio = 0.0 if duration <= 0 else min(1.0, max(0.0, position / duration))
+    fill_x = bar_x1 + int((bar_x2 - bar_x1) * ratio)
+    cv2.rectangle(frame, (bar_x1, bar_y1), (fill_x, bar_y2), (70, 210, 70), -1)
+    cv2.circle(frame, (fill_x, (bar_y1 + bar_y2) // 2), 7, (230, 230, 230), -1)
 
-    cv2.rectangle(frame, (next_x1, y1), (next_x2, y2), (30, 120, 30), -1)
-    cv2.rectangle(frame, (next_x1, y1), (next_x2, y2), (80, 255, 80), 2)
-    cv2.putText(frame, "Next", (next_x1 + 23, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
-
-    mode = "Auto Play" if auto_play else "Loop"
-    info = "{}/{}  {}  [{}]".format(index + 1, total, label, mode)
-    cv2.rectangle(frame, (10, frame.shape[0] - 38), (min(frame.shape[1] - 10, 760), frame.shape[0] - 8), (0, 0, 0), -1)
-    cv2.putText(frame, info, (18, frame.shape[0] - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-    return prev_rect, next_rect
+    mode = "Loop" if not auto_play else "Auto"
+    status = "Paused" if paused else "Playing"
+    info = "{}/{}  {}  {}  {:.2f}x  {} / {}".format(
+        index + 1,
+        total,
+        status,
+        mode,
+        speed,
+        _format_time(position),
+        _format_time(duration),
+    )
+    cv2.putText(frame, info, (18, panel_top + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    label_limit = max(12, (width - 36) // 9)
+    short_label = label if len(label) <= label_limit else "..." + label[-(label_limit - 3):]
+    cv2.putText(frame, short_label, (18, panel_top + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (190, 190, 190), 1)
+    return controls
 
 
 def point_in_rect(x, y, rect):
@@ -388,8 +571,19 @@ class PreviewState:
     def __init__(self):
         self.next_requested = False
         self.previous_requested = False
-        self.next_rect = None
-        self.previous_rect = None
+        self.pause_requested = False
+        self.replay_requested = False
+        self.speed_delta = 0
+        self.seek_ratio = None
+        self.controls = {}
+
+    def reset_requests(self):
+        self.next_requested = False
+        self.previous_requested = False
+        self.pause_requested = False
+        self.replay_requested = False
+        self.speed_delta = 0
+        self.seek_ratio = None
 
 
 class PreviewBuildJob:
@@ -470,8 +664,7 @@ def wait_for_preview(video, args, cv2, window, state, last_frame):
 
     action = "building skeleton in background" if args.direct else "building preview in background"
     print("{}: {}".format(action, video), flush=True)
-    state.next_rect = None
-    state.previous_rect = None
+    state.controls = {}
     job = PreviewBuildJob(video, args).start()
     while not job.done:
         frame = draw_loading(
@@ -504,14 +697,15 @@ def draw_direct_frame(frame, arrays, array_idx, args, display_filter, person_sta
     return frame
 
 
-def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
+def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1, label=None):
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise SystemExit("Cannot open video: {}".format(video))
     arrays = load_skeleton_arrays(skeleton_path)
     frame_to_array = {int(frame_idx): idx for idx, frame_idx in enumerate(arrays["frame_indices"])}
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    delay = max(1, int(1000 / max(1, fps * args.speed)))
+    speed = args.speed
+    paused = False
     display_filter = TemporalDisplayFilter(
         args.temporal_min_frames,
         args.temporal_max_jump,
@@ -524,22 +718,33 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
         args.kpt_thr,
     )
     frame_idx = 0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or arrays["keypoints"].shape[0])
+    last_frame = None
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            cap.release()
-            return "ended"
-        array_idx = frame_to_array.get(frame_idx, frame_idx)
-        frame = draw_direct_frame(frame, arrays, array_idx, args, display_filter, person_stabilizer, cv2)
+        if not paused or last_frame is None:
+            ok, frame = cap.read()
+            if not ok:
+                cap.release()
+                return "ended"
+            array_idx = frame_to_array.get(frame_idx, frame_idx)
+            frame = draw_direct_frame(frame, arrays, array_idx, args, display_filter, person_stabilizer, cv2)
+            last_frame = frame.copy()
+        else:
+            frame = last_frame.copy()
         frame = resize_for_preview(frame, args.max_width, args.max_height)
-        state.previous_rect, state.next_rect = draw_controls(
+        state.controls = draw_controls(
             frame,
-            Path(video).name,
+            label or video_name(video),
             index,
             total,
             auto_play=not args.loop_current,
+            paused=paused,
+            speed=speed,
+            position=frame_idx / fps,
+            duration=frame_count / fps,
         )
         cv2.imshow("NTU RTMW skeleton preview", frame)
+        delay = 50 if paused else max(1, int(1000 / max(1, fps * speed)))
         key = cv2.waitKey(delay) & 0xFF
         if key in (ord("q"), 27):
             cap.release()
@@ -550,6 +755,14 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
         if key in (ord("p"), ord("a")):
             cap.release()
             return "previous"
+        if key == ord(" "):
+            paused = not paused
+        if key == ord("r"):
+            state.seek_ratio = 0.0
+        if key in (ord("-"), ord("_")):
+            speed = max(0.25, speed / 1.25)
+        if key in (ord("+"), ord("=")):
+            speed = min(4.0, speed * 1.25)
         if state.previous_requested:
             state.previous_requested = False
             cap.release()
@@ -558,10 +771,36 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1):
             state.next_requested = False
             cap.release()
             return "next"
-        frame_idx += 1
+        if state.pause_requested:
+            state.pause_requested = False
+            paused = not paused
+        if state.replay_requested:
+            state.replay_requested = False
+            state.seek_ratio = 0.0
+        if state.speed_delta:
+            speed = min(4.0, max(0.25, speed * (1.25 ** state.speed_delta)))
+            state.speed_delta = 0
+        if state.seek_ratio is not None:
+            frame_idx = min(max(0, int(frame_count * state.seek_ratio)), max(0, frame_count - 1))
+            state.seek_ratio = None
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            last_frame = None
+            display_filter = TemporalDisplayFilter(
+                args.temporal_min_frames,
+                args.temporal_max_jump,
+                args.temporal_min_keypoints,
+                args.kpt_thr,
+            )
+            person_stabilizer = PersonStabilizer(
+                args.person_match_distance,
+                args.person_hold_frames,
+                args.kpt_thr,
+            )
+        elif not paused:
+            frame_idx += 1
 
 
-def play_playlist(videos, start_index, args):
+def play_playlist(videos, start_index, args, cache):
     import cv2
 
     state = PreviewState()
@@ -573,21 +812,57 @@ def play_playlist(videos, start_index, args):
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONUP:
             return
-        if state.previous_rect and point_in_rect(x, y, state.previous_rect):
-            state.previous_requested = True
-        elif state.next_rect and point_in_rect(x, y, state.next_rect):
-            state.next_requested = True
+        for action, rect in state.controls.items():
+            if not point_in_rect(x, y, rect):
+                continue
+            if action == "previous":
+                state.previous_requested = True
+            elif action == "next":
+                state.next_requested = True
+            elif action == "pause":
+                state.pause_requested = True
+            elif action == "replay":
+                state.replay_requested = True
+            elif action == "slower":
+                state.speed_delta = -1
+            elif action == "faster":
+                state.speed_delta = 1
+            elif action == "progress":
+                state.seek_ratio = (x - rect[0]) / max(1, rect[2] - rect[0])
+            break
 
     cv2.setMouseCallback(window, on_mouse)
     index = start_index
     while True:
-        video = videos[index]
+        state.reset_requests()
+        source = videos[index]
+        next_source = videos[(index + 1) % len(videos)]
+        cache.preload(source)
+
+        def show_extracting(item):
+            frame = draw_loading(last_frame, "Loading selected video from ZIP...", video_label(item))
+            cv2.imshow(window, frame)
+            cv2.waitKey(1)
+
+        video = cache.materialize(source, show_extracting)
+        if args.preload:
+            cache.preload(next_source)
+        cache.retain((source, next_source) if args.preload else (source,))
         preview = wait_for_preview(video, args, cv2, window, state, last_frame)
         if preview is None:
             cv2.destroyAllWindows()
             return
         if args.direct:
-            result = play_direct_video(video, preview, args, cv2, state, index, len(videos))
+            result = play_direct_video(
+                video,
+                preview,
+                args,
+                cv2,
+                state,
+                index,
+                len(videos),
+                label=video_name(source),
+            )
             if result == "quit":
                 cv2.destroyAllWindows()
                 return
@@ -609,26 +884,40 @@ def play_playlist(videos, start_index, args):
             continue
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        delay = max(1, int(1000 / max(1, fps * args.speed)))
+        speed = args.speed
+        paused = False
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        frame_idx = 0
+        playback_frame = None
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                if args.loop_current:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                index = (index + 1) % len(videos)
-                state.next_requested = False
-                break
+            if not paused or playback_frame is None:
+                ok, frame = cap.read()
+                if not ok:
+                    if args.loop_current:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        frame_idx = 0
+                        continue
+                    index = (index + 1) % len(videos)
+                    state.next_requested = False
+                    break
+                playback_frame = frame.copy()
+                last_frame = frame.copy()
+            else:
+                frame = playback_frame.copy()
             frame = resize_for_preview(frame, args.max_width, args.max_height)
-            last_frame = frame.copy()
-            state.previous_rect, state.next_rect = draw_controls(
+            state.controls = draw_controls(
                 frame,
-                Path(video).name,
+                video_name(source),
                 index,
                 len(videos),
                 auto_play=not args.loop_current,
+                paused=paused,
+                speed=speed,
+                position=frame_idx / fps,
+                duration=frame_count / fps,
             )
             cv2.imshow(window, frame)
+            delay = 50 if paused else max(1, int(1000 / max(1, fps * speed)))
             key = cv2.waitKey(delay) & 0xFF
             if key in (ord("q"), 27):
                 cap.release()
@@ -641,6 +930,14 @@ def play_playlist(videos, start_index, args):
                 state.previous_requested = False
                 state.next_requested = False
                 break
+            if key == ord(" "):
+                paused = not paused
+            if key == ord("r"):
+                state.seek_ratio = 0.0
+            if key in (ord("-"), ord("_")):
+                speed = max(0.25, speed / 1.25)
+            if key in (ord("+"), ord("=")):
+                speed = min(4.0, speed * 1.25)
             if state.previous_requested:
                 index = (index - 1) % len(videos)
                 state.previous_requested = False
@@ -651,6 +948,22 @@ def play_playlist(videos, start_index, args):
                 state.previous_requested = False
                 state.next_requested = False
                 break
+            if state.pause_requested:
+                state.pause_requested = False
+                paused = not paused
+            if state.replay_requested:
+                state.replay_requested = False
+                state.seek_ratio = 0.0
+            if state.speed_delta:
+                speed = min(4.0, max(0.25, speed * (1.25 ** state.speed_delta)))
+                state.speed_delta = 0
+            if state.seek_ratio is not None:
+                frame_idx = min(max(0, int(frame_count * state.seek_ratio)), max(0, frame_count - 1))
+                state.seek_ratio = None
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                playback_frame = None
+            elif not paused:
+                frame_idx += 1
         cap.release()
 
 
@@ -701,6 +1014,8 @@ def parser():
     p.add_argument("--list", action="store_true", help="List indexed preview videos and exit.")
     p.add_argument("--vis-dir", default=str(DEFAULT_VIS_DIR))
     p.add_argument("--out-dir", default=str(SKELETON_DIR))
+    p.add_argument("--archives-dir", default=str(RAW_ARCHIVES_DIR), help="ZIP directory used when videos are not already extracted.")
+    p.add_argument("--preload", action=argparse.BooleanOptionalAction, default=True, help="Preload the next archive video into the temporary cache.")
     p.add_argument("--device", default="auto", help="Device for preview generation. Default auto prefers cuda:0, then cpu.")
     p.add_argument("--cpu-threads", type=int, default=4, help="Limit CPU threads while generating a missing preview.")
     p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size while generating a missing preview.")
@@ -726,56 +1041,62 @@ def parser():
 
 def main():
     args = parser().parse_args()
-    videos = list_videos(EXTRACTED_DIR)
+    videos = list_videos(EXTRACTED_DIR, args.archives_dir)
     if args.list:
         for idx, path in enumerate(videos, 1):
-            print("{:4d}  {}".format(idx, path), flush=True)
+            print("{:4d}  {}".format(idx, video_label(path)), flush=True)
         return
 
     if args.video:
-        video = Path(args.video).resolve()
-        resolved = [p.resolve() for p in videos]
-        if video in resolved:
-            start_index = resolved.index(video)
+        requested = args.video.lower()
+        matches = [
+            idx for idx, item in enumerate(videos)
+            if requested in {video_name(item).lower(), str(item).lower()}
+        ]
+        if matches:
+            start_index = matches[0]
         else:
+            video = Path(args.video).resolve()
             videos = [video]
             start_index = 0
     else:
         if args.index < 1 or args.index > len(videos):
             raise SystemExit("--index must be between 1 and {}.".format(len(videos)))
         start_index = args.index - 1
-    video = videos[start_index]
-    if args.no_window:
-        if args.direct:
-            skeleton_path = ensure_skeleton(
-                video=video,
-                out_dir=args.out_dir,
-                regenerate=args.regenerate,
-                device=args.device,
-                cpu_threads=args.cpu_threads,
-                pose_batch_size=args.pose_batch_size,
-                temporal_min_frames=args.temporal_min_frames,
-                temporal_max_jump=args.temporal_max_jump,
-                temporal_min_keypoints=args.temporal_min_keypoints,
-            )
-            print("skeleton file: {}".format(skeleton_path.resolve()), flush=True)
+    source = videos[start_index]
+    with ArchiveVideoCache() as cache:
+        if args.no_window:
+            video = cache.materialize(source)
+            if args.direct:
+                skeleton_path = ensure_skeleton(
+                    video=video,
+                    out_dir=args.out_dir,
+                    regenerate=args.regenerate,
+                    device=args.device,
+                    cpu_threads=args.cpu_threads,
+                    pose_batch_size=args.pose_batch_size,
+                    temporal_min_frames=args.temporal_min_frames,
+                    temporal_max_jump=args.temporal_max_jump,
+                    temporal_min_keypoints=args.temporal_min_keypoints,
+                )
+                print("skeleton file: {}".format(skeleton_path.resolve()), flush=True)
+            else:
+                vis_video, vis_image = ensure_visualization(
+                    video=video,
+                    out_dir=args.out_dir,
+                    vis_dir=args.vis_dir,
+                    regenerate=args.regenerate,
+                    device=args.device,
+                    cpu_threads=args.cpu_threads,
+                    pose_batch_size=args.pose_batch_size,
+                    temporal_min_frames=args.temporal_min_frames,
+                    temporal_max_jump=args.temporal_max_jump,
+                    temporal_min_keypoints=args.temporal_min_keypoints,
+                )
+                print("preview video: {}".format(vis_video.resolve()), flush=True)
+                print("preview image: {}".format(vis_image.resolve()), flush=True)
         else:
-            vis_video, vis_image = ensure_visualization(
-                video=video,
-                out_dir=args.out_dir,
-                vis_dir=args.vis_dir,
-                regenerate=args.regenerate,
-                device=args.device,
-                cpu_threads=args.cpu_threads,
-                pose_batch_size=args.pose_batch_size,
-                temporal_min_frames=args.temporal_min_frames,
-                temporal_max_jump=args.temporal_max_jump,
-                temporal_min_keypoints=args.temporal_min_keypoints,
-            )
-            print("preview video: {}".format(vis_video.resolve()), flush=True)
-            print("preview image: {}".format(vis_image.resolve()), flush=True)
-    else:
-        play_playlist(videos, start_index, args)
+            play_playlist(videos, start_index, args, cache)
 
 
 if __name__ == "__main__":
