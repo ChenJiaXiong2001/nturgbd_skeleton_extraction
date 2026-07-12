@@ -4,7 +4,7 @@ import json
 import multiprocessing
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .compat import patch_runtime
@@ -109,6 +109,32 @@ def output_path(video, input_root, output_root):
     if input_root.is_dir():
         return output_root / video.relative_to(input_root).with_suffix(".npz")
     return output_root / "{}.npz".format(video.stem)
+
+
+def path_exists(path):
+    return Path(path).exists()
+
+
+def plan_video_jobs(videos, args):
+    """Build pending jobs, checking existing outputs concurrently when requested."""
+    total = len(videos)
+    candidates = []
+    for index, video in enumerate(videos, 1):
+        out = output_path(video, args.input, args.output)
+        candidates.append((index, total, str(video), str(out)))
+
+    if not args.skip_existing:
+        return [], candidates
+
+    scan_workers = min(max(1, int(getattr(args, "scan_workers", 32) or 32)), total)
+    print("checking existing outputs with {} threads".format(scan_workers), flush=True)
+    with ThreadPoolExecutor(max_workers=scan_workers) as executor:
+        existing = list(executor.map(path_exists, (job[3] for job in candidates)))
+
+    outputs = [Path(job[3]) for job, exists in zip(candidates, existing) if exists]
+    jobs = [job for job, exists in zip(candidates, existing) if not exists]
+    print("existing outputs: {}; missing: {}".format(len(outputs), len(jobs)), flush=True)
+    return outputs, jobs
 
 
 def unwrap_predictions(result):
@@ -748,15 +774,7 @@ def run(args):
         print("No videos found in {}".format(args.input), flush=True)
         return []
     print("RTMW extracting {} video(s)".format(len(videos)), flush=True)
-    outputs = []
-    jobs = []
-    for i, video in enumerate(videos, 1):
-        out = output_path(video, args.input, args.output)
-        if args.skip_existing and out.exists():
-            print("[{}/{}] skip {}".format(i, len(videos), out.name), flush=True)
-            outputs.append(out)
-            continue
-        jobs.append((i, len(videos), str(video), str(out)))
+    outputs, jobs = plan_video_jobs(videos, args)
     if not jobs:
         return outputs
 
@@ -827,6 +845,7 @@ def parser():
     p.add_argument("--cpu-workers", type=int, default=0, help="Additional CPU-only workers sharing a dynamic video queue with CUDA workers.")
     p.add_argument("--cpu-worker-threads", type=int, default=4, help="Compute threads used by each additional CPU-only worker.")
     p.add_argument("--cpu-pose-batch-size", type=int, default=1, help="MMPose batch size for additional CPU-only workers.")
+    p.add_argument("--scan-workers", type=int, default=32, help="Threads used to check existing output files before extraction.")
     return p
 
 

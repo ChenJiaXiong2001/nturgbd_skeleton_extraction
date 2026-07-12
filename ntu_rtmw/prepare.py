@@ -55,6 +55,7 @@ def parser():
     p.add_argument("--cpu-workers", type=int, default=0, help="Additional CPU-only workers sharing a dynamic video queue with CUDA workers.")
     p.add_argument("--cpu-worker-threads", type=int, default=4, help="Compute threads used by each additional CPU-only worker.")
     p.add_argument("--cpu-pose-batch-size", type=int, default=1, help="MMPose batch size for additional CPU-only workers.")
+    p.add_argument("--scan-workers", type=int, default=32, help="Threads used to check existing output files before extraction.")
     return p
 
 
@@ -89,6 +90,7 @@ def make_extract_args(args, input_dir, output_dir, weights_path, det_weights_pat
         cpu_workers=args.cpu_workers,
         cpu_worker_threads=args.cpu_worker_threads,
         cpu_pose_batch_size=args.cpu_pose_batch_size,
+        scan_workers=args.scan_workers,
     )
 
 

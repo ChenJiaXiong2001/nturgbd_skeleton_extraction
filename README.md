@@ -147,7 +147,7 @@ Run CUDA extraction and use otherwise-idle CPU cores for additional videos from
 the same input set:
 
 ```powershell
-py -3.10 main.py --device cuda:0 --workers 4 --pose-batch-size 8 --cpu-workers 8 --cpu-worker-threads 4 --cpu-pose-batch-size 1
+py -3.10 main.py --device cuda:0 --workers 4 --pose-batch-size 8 --cpu-workers 8 --cpu-worker-threads 4 --cpu-pose-batch-size 1 --scan-workers 32
 ```
 
 `--workers` remains the number of CUDA workers. `--cpu-workers` adds CPU-only
@@ -155,6 +155,11 @@ workers. All workers consume a shared dynamic queue, so faster CUDA workers
 automatically process more videos and no input is assigned twice. Each worker
 loads its own RTMDet and RTMW models; start with 4 to 8 CPU workers and watch
 system RAM and storage throughput before increasing the count.
+
+With `--skip-existing` (the default in `main.py`), output existence checks run
+in parallel before inference. `--scan-workers` controls this file-system scan;
+32 is a suitable starting point for SSD storage. Existing files are summarized
+instead of logged one per line.
 
 Show skeleton extraction live for one video:
 
