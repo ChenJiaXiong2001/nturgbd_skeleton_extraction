@@ -143,6 +143,19 @@ increase with the worker count. On Linux with CUDA, parallel extraction uses the
 If a multi-worker run is unstable, first fall back to `--workers 1` and increase
 `--pose-batch-size` instead.
 
+Run CUDA extraction and use otherwise-idle CPU cores for additional videos from
+the same input set:
+
+```powershell
+py -3.10 main.py --device cuda:0 --workers 4 --pose-batch-size 8 --cpu-workers 8 --cpu-worker-threads 4 --cpu-pose-batch-size 1
+```
+
+`--workers` remains the number of CUDA workers. `--cpu-workers` adds CPU-only
+workers. All workers consume a shared dynamic queue, so faster CUDA workers
+automatically process more videos and no input is assigned twice. Each worker
+loads its own RTMDet and RTMW models; start with 4 to 8 CPU workers and watch
+system RAM and storage throughput before increasing the count.
+
 Show skeleton extraction live for one video:
 
 ```powershell

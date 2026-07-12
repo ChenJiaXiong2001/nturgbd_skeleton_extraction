@@ -675,6 +675,63 @@ def run_worker(worker_id, jobs, args):
     return outputs
 
 
+def run_queued_worker(worker_id, worker_kind, job_queue, args):
+    """Consume videos from a shared queue so faster devices take more work."""
+    configure_cpu_threads(args)
+    inferencer = build_inferencer(args)
+    outputs = []
+    while True:
+        job = job_queue.get()
+        if job is None:
+            break
+        index, total, video, out = job
+        video = Path(video)
+        out = Path(out)
+        print("[{}/{}] {} worker {} {}".format(index, total, worker_kind, worker_id, video), flush=True)
+        save_npz(out, video, infer_video(inferencer, video, args), args)
+        print("  saved {}".format(out), flush=True)
+        outputs.append(str(out))
+    return outputs
+
+
+def run_hybrid_workers(jobs, args, gpu_workers, cpu_workers):
+    """Run CUDA and CPU inferencers together against one dynamic job queue."""
+    gpu_workers = min(max(1, gpu_workers), len(jobs))
+    cpu_workers = min(max(0, cpu_workers), max(0, len(jobs) - gpu_workers))
+    if cpu_workers == 0:
+        return None
+
+    gpu_args = argparse.Namespace(**vars(args))
+    cpu_args = argparse.Namespace(**vars(args))
+    cpu_args.device = "cpu"
+    cpu_args.cpu_threads = max(1, int(getattr(args, "cpu_worker_threads", 4) or 4))
+    cpu_args.pose_batch_size = max(1, int(getattr(args, "cpu_pose_batch_size", 1) or 1))
+
+    mp_context = multiprocessing.get_context("spawn")
+    total_workers = gpu_workers + cpu_workers
+    print(
+        "hybrid workers: {} GPU + {} CPU (dynamic queue, spawn)".format(gpu_workers, cpu_workers),
+        flush=True,
+    )
+    with mp_context.Manager() as manager:
+        job_queue = manager.Queue()
+        for job in jobs:
+            job_queue.put(job)
+        for _ in range(total_workers):
+            job_queue.put(None)
+
+        outputs = []
+        with ProcessPoolExecutor(max_workers=total_workers, mp_context=mp_context) as executor:
+            futures = []
+            for worker_id in range(1, gpu_workers + 1):
+                futures.append(executor.submit(run_queued_worker, worker_id, "GPU", job_queue, gpu_args))
+            for worker_id in range(1, cpu_workers + 1):
+                futures.append(executor.submit(run_queued_worker, worker_id, "CPU", job_queue, cpu_args))
+            for future in as_completed(futures):
+                outputs.extend(Path(path) for path in future.result())
+    return outputs
+
+
 def run(args):
     ensure_supported_python()
     configure_cpu_threads(args)
@@ -704,6 +761,16 @@ def run(args):
         return outputs
 
     workers = effective_workers(args, len(jobs))
+    cpu_workers = max(0, int(getattr(args, "cpu_workers", 0) or 0))
+    if cpu_workers and str(args.device).lower().startswith("cuda") and not args.show_skeleton:
+        hybrid_outputs = run_hybrid_workers(jobs, args, workers, cpu_workers)
+        if hybrid_outputs is not None:
+            outputs.extend(hybrid_outputs)
+            return outputs
+    elif cpu_workers:
+        reason = "interactive visualization is enabled" if args.show_skeleton else "the primary device is not CUDA"
+        print("CPU hybrid workers disabled because {}; using the primary workers only".format(reason), flush=True)
+
     if workers == 1:
         inferencer = build_inferencer(args)
         for i, total, video, out in jobs:
@@ -757,6 +824,9 @@ def parser():
     p.add_argument("--cpu-threads", type=int, default=0, help="Limit CPU compute threads per process. Try 4 or 8 if CPU is pinned.")
     p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size. Try 4 or 8 when CPU is saturated and GPU is underused.")
     p.add_argument("--workers", type=int, default=1, help="Parallel video extraction workers. Try 2 first on one GPU.")
+    p.add_argument("--cpu-workers", type=int, default=0, help="Additional CPU-only workers sharing a dynamic video queue with CUDA workers.")
+    p.add_argument("--cpu-worker-threads", type=int, default=4, help="Compute threads used by each additional CPU-only worker.")
+    p.add_argument("--cpu-pose-batch-size", type=int, default=1, help="MMPose batch size for additional CPU-only workers.")
     return p
 
 
