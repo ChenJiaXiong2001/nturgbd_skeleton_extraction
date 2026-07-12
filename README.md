@@ -191,6 +191,12 @@ provide previous/next, a searchable `Select` file picker, pause/play, replay,
 speed adjustment, and a clickable seek bar. Keyboard shortcuts are `n`/`p`,
 `g` (select), Space, `r`, `-`/`+`, and `q` or `Esc`. Add `--loop-current` if
 you want one clip to replay instead.
+
+The right sidebar groups large playlists by archive and blocks of 100 files,
+for example `s001 1-100` and `s001 101-200`. Use the section buttons to move
+between blocks, the mouse wheel to scroll inside a block, and click a filename
+to load it. Only indexed `*_rgb.avi` members can be opened; rapid duplicate
+clicks are ignored and ZIP extraction is serialized to protect the cache.
 Use `--list` to print numbered videos, then `--index N` to start previewing
 from the Nth video.
 For close two-person interactions, direct preview keeps person slots stable

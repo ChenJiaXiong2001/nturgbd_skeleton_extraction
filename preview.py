@@ -2,6 +2,7 @@ import argparse
 import shutil
 import tempfile
 import threading
+import time
 import zipfile
 from argparse import Namespace
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from ntu_rtmw.extract import TemporalDisplayFilter, draw_skeleton, run as extrac
 DEFAULT_VIS_DIR = Path("data") / "visualizations_preview"
 DEFAULT_MAX_WIDTH = 960
 DEFAULT_MAX_HEIGHT = 540
+SIDEBAR_WIDTH = 330
+SIDEBAR_ROW_HEIGHT = 27
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,30 @@ def video_label(video):
     return str(Path(video))
 
 
+def video_group(video):
+    if isinstance(video, ArchiveVideo):
+        name = video.archive.stem.lower()
+        return name.removeprefix("nturgbd_rgb_")
+    path = Path(video)
+    try:
+        relative = path.resolve().relative_to(EXTRACTED_DIR.resolve())
+        return relative.parts[0] if len(relative.parts) > 1 else path.parent.name
+    except ValueError:
+        return path.parent.name or "files"
+
+
+def build_video_sections(videos, section_size=100):
+    groups = {}
+    for index, video in enumerate(videos):
+        groups.setdefault(video_group(video), []).append(index)
+    sections = []
+    for group, indices in groups.items():
+        for start in range(0, len(indices), section_size):
+            chunk = indices[start:start + section_size]
+            sections.append(("{}  {}-{}".format(group, start + 1, start + len(chunk)), chunk))
+    return sections
+
+
 class ArchiveVideoCache:
     """Materialize only selected ZIP members and preload one upcoming video."""
 
@@ -65,6 +92,7 @@ class ArchiveVideoCache:
         self._jobs = {}
         self._errors = {}
         self._lock = threading.Lock()
+        self._extract_lock = threading.Lock()
         self._closed = False
 
     def _target(self, source):
@@ -76,9 +104,14 @@ class ArchiveVideoCache:
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.with_suffix(target.suffix + ".part")
         try:
-            with zipfile.ZipFile(source.archive) as zf, zf.open(source.member) as src, partial.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=4 * 1024 * 1024)
-            partial.replace(target)
+            with self._extract_lock:
+                with zipfile.ZipFile(source.archive) as zf:
+                    info = zf.getinfo(source.member)
+                    if info.is_dir() or not source.name.lower().endswith("_rgb.avi") or info.file_size <= 0:
+                        raise ValueError("Refusing unsafe or invalid video member: {}".format(source.member))
+                    with zf.open(info) as src, partial.open("wb") as dst:
+                        shutil.copyfileobj(src, dst, length=4 * 1024 * 1024)
+                partial.replace(target)
             with self._lock:
                 if not self._closed:
                     self._paths[source] = target
@@ -563,6 +596,65 @@ def draw_controls(
     return controls
 
 
+def draw_sidebar(frame, videos, current_index, state, cv2):
+    import numpy as np
+
+    height = frame.shape[0]
+    panel = np.full((height, SIDEBAR_WIDTH, 3), 24, dtype=np.uint8)
+    cv2.rectangle(panel, (0, 0), (SIDEBAR_WIDTH - 1, height - 1), (85, 85, 85), 1)
+    if not state.sidebar_sections:
+        return np.concatenate((frame, panel), axis=1)
+
+    section_index = min(max(0, state.sidebar_section), len(state.sidebar_sections) - 1)
+    title, indices = state.sidebar_sections[section_index]
+    cv2.putText(panel, "Files", (14, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1)
+    cv2.putText(panel, "section {}/{}".format(section_index + 1, len(state.sidebar_sections)), (175, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 170, 170), 1)
+
+    prev_rect = (12, 36, 82, 65)
+    next_rect = (SIDEBAR_WIDTH - 82, 36, SIDEBAR_WIDTH - 12, 65)
+    state.controls["section_previous"] = tuple(value + (frame.shape[1] if pos % 2 == 0 else 0) for pos, value in enumerate(prev_rect))
+    state.controls["section_next"] = tuple(value + (frame.shape[1] if pos % 2 == 0 else 0) for pos, value in enumerate(next_rect))
+    cv2.rectangle(panel, prev_rect[:2], prev_rect[2:], (65, 65, 65), -1)
+    cv2.rectangle(panel, next_rect[:2], next_rect[2:], (65, 65, 65), -1)
+    cv2.putText(panel, "< 100", (22, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (240, 240, 240), 1)
+    cv2.putText(panel, "100 >", (next_rect[0] + 15, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (240, 240, 240), 1)
+    cv2.putText(panel, title, (92, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (90, 220, 90), 1)
+
+    list_top = 76
+    footer_height = 34
+    visible_count = max(1, (height - list_top - footer_height) // SIDEBAR_ROW_HEIGHT)
+    max_offset = max(0, len(indices) - visible_count)
+    state.sidebar_offset = min(max(0, state.sidebar_offset), max_offset)
+    visible = indices[state.sidebar_offset:state.sidebar_offset + visible_count]
+    for row, video_index in enumerate(visible):
+        y1 = list_top + row * SIDEBAR_ROW_HEIGHT
+        y2 = y1 + SIDEBAR_ROW_HEIGHT - 2
+        selected = video_index == current_index
+        color = (45, 105, 45) if selected else ((42, 42, 42) if row % 2 == 0 else (32, 32, 32))
+        cv2.rectangle(panel, (7, y1), (SIDEBAR_WIDTH - 15, y2), color, -1)
+        text = "{:4d}  {}".format(video_index + 1, video_name(videos[video_index]))
+        if len(text) > 42:
+            text = text[:39] + "..."
+        cv2.putText(panel, text, (12, y1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (245, 245, 245), 1)
+        state.controls[("video", video_index)] = (
+            frame.shape[1] + 7,
+            y1,
+            frame.shape[1] + SIDEBAR_WIDTH - 15,
+            y2,
+        )
+
+    if len(indices) > visible_count:
+        track_top, track_bottom = list_top, height - footer_height
+        thumb_h = max(24, int((track_bottom - track_top) * visible_count / len(indices)))
+        travel = max(1, track_bottom - track_top - thumb_h)
+        thumb_y = track_top + int(travel * state.sidebar_offset / max_offset)
+        cv2.rectangle(panel, (SIDEBAR_WIDTH - 10, track_top), (SIDEBAR_WIDTH - 5, track_bottom), (55, 55, 55), -1)
+        cv2.rectangle(panel, (SIDEBAR_WIDTH - 10, thumb_y), (SIDEBAR_WIDTH - 5, thumb_y + thumb_h), (150, 150, 150), -1)
+
+    cv2.putText(panel, "Wheel: scroll   Click: open", (12, height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (170, 170, 170), 1)
+    return np.concatenate((frame, panel), axis=1)
+
+
 def point_in_rect(x, y, rect):
     x1, y1, x2, y2 = rect
     return x1 <= x <= x2 and y1 <= y <= y2
@@ -626,6 +718,12 @@ class PreviewState:
         self.speed_delta = 0
         self.seek_ratio = None
         self.select_requested = False
+        self.jump_index = None
+        self.sidebar_sections = []
+        self.sidebar_videos = []
+        self.sidebar_section = 0
+        self.sidebar_offset = 0
+        self.last_file_click = 0.0
         self.controls = {}
 
     def reset_requests(self):
@@ -636,6 +734,24 @@ class PreviewState:
         self.speed_delta = 0
         self.seek_ratio = None
         self.select_requested = False
+
+    def configure_sidebar(self, videos):
+        self.sidebar_videos = videos
+        self.sidebar_sections = build_video_sections(videos)
+
+    def focus_sidebar(self, video_index):
+        for section_index, (_, indices) in enumerate(self.sidebar_sections):
+            if video_index in indices:
+                self.sidebar_section = section_index
+                position = indices.index(video_index)
+                self.sidebar_offset = max(0, position - 5)
+                return
+
+    def change_section(self, delta):
+        if not self.sidebar_sections:
+            return
+        self.sidebar_section = min(max(0, self.sidebar_section + delta), len(self.sidebar_sections) - 1)
+        self.sidebar_offset = 0
 
 
 class PreviewBuildJob:
@@ -795,6 +911,7 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1, 
             position=frame_idx / fps,
             duration=frame_count / fps,
         )
+        frame = draw_sidebar(frame, state.sidebar_videos, index, state, cv2)
         cv2.imshow("NTU RTMW skeleton preview", frame)
         delay = 50 if paused else max(1, int(1000 / max(1, fps * speed)))
         key = cv2.waitKey(delay) & 0xFF
@@ -830,6 +947,9 @@ def play_direct_video(video, skeleton_path, args, cv2, state, index=0, total=1, 
             state.select_requested = False
             cap.release()
             return "select"
+        if state.jump_index is not None:
+            cap.release()
+            return "jump"
         if state.pause_requested:
             state.pause_requested = False
             paused = not paused
@@ -863,12 +983,17 @@ def play_playlist(videos, start_index, args, cache):
     import cv2
 
     state = PreviewState()
+    state.configure_sidebar(videos)
     window = "NTU RTMW skeleton preview"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, args.max_width, args.max_height)
+    cv2.resizeWindow(window, args.max_width + SIDEBAR_WIDTH, args.max_height)
     last_frame = None
 
     def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEWHEEL:
+            delta = cv2.getMouseWheelDelta(flags) if hasattr(cv2, "getMouseWheelDelta") else flags
+            state.sidebar_offset = max(0, state.sidebar_offset + (-5 if delta > 0 else 5))
+            return
         if event != cv2.EVENT_LBUTTONUP:
             return
         for action, rect in state.controls.items():
@@ -880,6 +1005,15 @@ def play_playlist(videos, start_index, args, cache):
                 state.next_requested = True
             elif action == "select":
                 state.select_requested = True
+            elif action == "section_previous":
+                state.change_section(-1)
+            elif action == "section_next":
+                state.change_section(1)
+            elif isinstance(action, tuple) and action[0] == "video":
+                now = time.monotonic()
+                if now - state.last_file_click >= 0.3:
+                    state.jump_index = action[1]
+                    state.last_file_click = now
             elif action == "pause":
                 state.pause_requested = True
             elif action == "replay":
@@ -896,6 +1030,7 @@ def play_playlist(videos, start_index, args, cache):
     index = start_index
     while True:
         state.reset_requests()
+        state.focus_sidebar(index)
         source = videos[index]
         next_source = videos[(index + 1) % len(videos)]
         cache.preload(source)
@@ -929,6 +1064,11 @@ def play_playlist(videos, start_index, args, cache):
                 return
             if result == "select":
                 index = choose_video_index(videos, index)
+                continue
+            if result == "jump":
+                if state.jump_index is not None and 0 <= state.jump_index < len(videos):
+                    index = state.jump_index
+                state.jump_index = None
                 continue
             if result == "previous":
                 index = (index - 1) % len(videos)
@@ -981,6 +1121,7 @@ def play_playlist(videos, start_index, args, cache):
                 position=frame_idx / fps,
                 duration=frame_count / fps,
             )
+            frame = draw_sidebar(frame, videos, index, state, cv2)
             cv2.imshow(window, frame)
             delay = 50 if paused else max(1, int(1000 / max(1, fps * speed)))
             key = cv2.waitKey(delay) & 0xFF
@@ -1019,6 +1160,11 @@ def play_playlist(videos, start_index, args, cache):
             if state.select_requested:
                 state.select_requested = False
                 select_after = True
+                break
+            if state.jump_index is not None:
+                if 0 <= state.jump_index < len(videos):
+                    index = state.jump_index
+                state.jump_index = None
                 break
             if state.pause_requested:
                 state.pause_requested = False
