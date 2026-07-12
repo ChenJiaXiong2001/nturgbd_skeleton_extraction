@@ -52,6 +52,9 @@ def parser():
     p.add_argument("--cpu-threads", type=int, default=0, help="Limit CPU compute threads per process. Try 4 or 8 if CPU is pinned.")
     p.add_argument("--pose-batch-size", type=int, default=1, help="MMPose inferencer batch size. Try 4 or 8 when CPU is saturated and GPU is underused.")
     p.add_argument("--workers", type=int, default=1, help="Parallel video extraction workers. Try 2 first on one GPU.")
+    p.add_argument("--cpu-workers", type=int, default=0, help="Additional CPU-only workers sharing a dynamic video queue with CUDA workers.")
+    p.add_argument("--cpu-worker-threads", type=int, default=4, help="Compute threads used by each additional CPU-only worker.")
+    p.add_argument("--cpu-pose-batch-size", type=int, default=1, help="MMPose batch size for additional CPU-only workers.")
     return p
 
 
@@ -83,6 +86,9 @@ def make_extract_args(args, input_dir, output_dir, weights_path, det_weights_pat
         cpu_threads=args.cpu_threads,
         pose_batch_size=args.pose_batch_size,
         workers=args.workers,
+        cpu_workers=args.cpu_workers,
+        cpu_worker_threads=args.cpu_worker_threads,
+        cpu_pose_batch_size=args.cpu_pose_batch_size,
     )
 
 
