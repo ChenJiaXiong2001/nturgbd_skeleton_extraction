@@ -345,7 +345,29 @@ hidden. Tune this with `--temporal-min-frames`, `--temporal-max-jump`, and
 
 ## Skeleton Quality Check and Retry
 
-Check every saved skeleton and write JSON, CSV, and a failed-file list:
+All default paths are derived from the repository location, so the normal
+check needs no path arguments on either Windows or Linux:
+
+```bash
+python check_skeletons.py
+```
+
+The checker prints the number of discovered files and live progress, throughput,
+elapsed time, and estimated remaining time. For HDDs or network-mounted data,
+start with `--workers 2`; using too many workers can reduce throughput because
+compressed `.npz` files compete for disk reads.
+
+This automatically uses:
+
+```text
+data/skeletons_rtmw
+data/extracted
+data/quality_reports
+data/skeletons_rtmw_retry
+```
+
+An explicit input path can still be provided when skeletons are stored outside
+the project:
 
 ```powershell
 py -3.10 check_skeletons.py data\skeletons_rtmw
@@ -373,7 +395,16 @@ Additional NTU120 two-person labels can be supplied as ranges or individual
 actions, for example `--two-person-actions 50-60,106-110`.
 
 Failed files can be re-extracted from their source videos into a separate
-directory:
+directory. With the standard project layout, only the action flags are needed:
+
+```bash
+python check_skeletons.py \
+  --reextract-failed \
+  --retry-profile relaxed \
+  --device cuda:0
+```
+
+The equivalent command with explicit Windows paths is:
 
 ```powershell
 py -3.10 check_skeletons.py data\skeletons_rtmw `

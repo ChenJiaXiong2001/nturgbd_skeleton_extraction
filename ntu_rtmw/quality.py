@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .constants import EXTRACTED_DIR, SKELETON_DIR, VIDEO_EXTENSIONS
+from .constants import DATA_DIR, EXTRACTED_DIR, SKELETON_DIR, VIDEO_EXTENSIONS
 from .manifest import meta_from_path
 
 
@@ -452,14 +452,52 @@ def mark_duplicate_samples(results):
     return results
 
 
-def scan_skeletons(input_path, thresholds=None, workers=4):
+def _print_scan_progress(done, total, started, force=False):
+    elapsed = max(time.monotonic() - started, 1e-9)
+    rate = done / elapsed
+    remaining = max(0, total - done)
+    eta = remaining / rate if rate > 0 else 0.0
+    print(
+        "checked {}/{} ({:.1f}%) | {:.1f} files/s | elapsed {:.0f}s | eta {:.0f}s".format(
+            done,
+            total,
+            100.0 * done / max(total, 1),
+            rate,
+            elapsed,
+            eta,
+        ),
+        flush=True,
+    )
+
+
+def scan_skeletons(input_path, thresholds=None, workers=4, show_progress=False):
     thresholds = thresholds or QualityThresholds()
+    if show_progress:
+        print("discovering .npz files under {}".format(Path(input_path)), flush=True)
     paths = find_npz_files(input_path)
     if not paths:
         return []
     workers = min(max(1, int(workers or 1)), len(paths))
+    started = time.monotonic()
+    progress_step = max(1, len(paths) // 20)
+    next_progress = progress_step
+    last_progress_time = started
+    if show_progress:
+        print("found {} .npz files; checking with {} worker(s)".format(len(paths), workers), flush=True)
     if workers == 1:
-        return mark_duplicate_samples([evaluate_npz(path, thresholds) for path in paths])
+        results = []
+        for done, path in enumerate(paths, 1):
+            results.append(evaluate_npz(path, thresholds))
+            now = time.monotonic()
+            if show_progress and (
+                done == len(paths)
+                or done >= next_progress
+                or now - last_progress_time >= 5.0
+            ):
+                _print_scan_progress(done, len(paths), started)
+                next_progress = done + progress_step
+                last_progress_time = now
+        return mark_duplicate_samples(results)
 
     indexed_results = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -482,6 +520,16 @@ def scan_skeletons(input_path, thresholds=None, workers=4):
                     "reasons": ["worker_error: {}".format(exc)],
                     "warnings": [],
                 }
+            done = len(indexed_results)
+            now = time.monotonic()
+            if show_progress and (
+                done == len(paths)
+                or done >= next_progress
+                or now - last_progress_time >= 5.0
+            ):
+                _print_scan_progress(done, len(paths), started)
+                next_progress = done + progress_step
+                last_progress_time = now
     return mark_duplicate_samples([indexed_results[index] for index in range(len(paths))])
 
 
@@ -750,8 +798,13 @@ def parser():
     p = argparse.ArgumentParser(
         description="Check RTMW skeleton .npz quality and optionally re-extract failed samples."
     )
-    p.add_argument("input", nargs="?", default=str(SKELETON_DIR), help="Skeleton .npz file or directory.")
-    p.add_argument("--report-dir", default="data/quality_reports")
+    p.add_argument(
+        "input",
+        nargs="?",
+        default=str(SKELETON_DIR),
+        help="Skeleton .npz file or directory. Default: project data/skeletons_rtmw.",
+    )
+    p.add_argument("--report-dir", default=str(DATA_DIR / "quality_reports"))
     p.add_argument("--report-prefix", default="skeleton_quality")
     p.add_argument("--workers", type=int, default=4, help="Parallel workers used only for .npz checks.")
     p.add_argument("--two-person-actions", default="50-60")
@@ -769,7 +822,7 @@ def parser():
     p.add_argument("--max-slot-jump-rate", type=float, default=0.05)
     p.add_argument("--reextract-failed", action="store_true")
     p.add_argument("--video-root", default=str(EXTRACTED_DIR))
-    p.add_argument("--retry-output")
+    p.add_argument("--retry-output", default=str(DATA_DIR / "skeletons_rtmw_retry"))
     p.add_argument("--retry-profile", choices=["standard", "relaxed"], default="relaxed")
     p.add_argument("--retry-limit", type=int)
     p.add_argument("--device", default="auto")
@@ -805,24 +858,28 @@ def thresholds_from_args(args):
 def main(argv=None):
     args = parser().parse_args(argv)
     thresholds = thresholds_from_args(args)
-    print("checking {}".format(Path(args.input)), flush=True)
-    results = scan_skeletons(args.input, thresholds, args.workers)
+    input_path = Path(args.input).expanduser().resolve()
+    report_dir = Path(args.report_dir).expanduser().resolve()
+    video_root = Path(args.video_root).expanduser().resolve()
+    retry_output = Path(args.retry_output).expanduser().resolve()
+    print("project paths", flush=True)
+    print("  skeletons {}".format(input_path), flush=True)
+    print("  reports   {}".format(report_dir), flush=True)
+    if args.reextract_failed:
+        print("  videos    {}".format(video_root), flush=True)
+        print("  retry     {}".format(retry_output), flush=True)
+    print("checking {}".format(input_path), flush=True)
+    results = scan_skeletons(input_path, thresholds, args.workers, show_progress=True)
     if not results:
-        raise SystemExit("No .npz skeleton files found under {}".format(args.input))
+        raise SystemExit("No .npz skeleton files found under {}".format(input_path))
 
     retry_records = []
     if args.reextract_failed:
-        input_path = Path(args.input)
-        retry_output = Path(args.retry_output) if args.retry_output else (
-            input_path.parent / "{}_retry".format(input_path.name)
-            if input_path.is_dir()
-            else Path("data/reextracted_skeletons")
-        )
         retry_records = reextract_failed(
             results,
             thresholds,
-            args.input,
-            args.video_root,
+            input_path,
+            video_root,
             retry_output,
             device=args.device,
             profile=args.retry_profile,
@@ -847,7 +904,7 @@ def main(argv=None):
     json_path, csv_path, failed_path = write_reports(
         results,
         thresholds,
-        args.report_dir,
+        report_dir,
         args.report_prefix,
     )
     summary = report_summary(results)
