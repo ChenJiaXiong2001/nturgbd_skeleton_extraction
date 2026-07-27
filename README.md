@@ -453,6 +453,31 @@ python check_skeletons.py \
 YOLO26-X changes only person detection. RTMW-L remains the pose model, and the
 same quality thresholds decide whether a retry passes.
 
+To complete checking, YOLO26 repair, replacement, and failed-file cleanup in
+one command, use:
+
+```bash
+python check_skeletons.py data/skeletons_rtmw \
+  --repair-failed-yolo26 \
+  --archives-dir data/raw_archives \
+  --retry-temp-dir /dev/shm \
+  --retry-output data/skeletons_rtmw_retry_yolo \
+  --device cuda:0 \
+  --workers 2 \
+  --no-fail-exit
+```
+
+This shortcut enables `--reextract-failed`, selects the YOLO26 detector,
+replaces an original when its retry passes, and deletes the selected original
+when it still fails. Replaced originals are backed up under
+`data/skeletons_rtmw_retry_yolo/original_backup`. Add `--retry-limit 100` for a
+pilot run; only those 100 selected failures can be replaced or deleted, and all
+unselected files remain untouched.
+
+To delete failed files without attempting re-extraction, use
+`--delete-failed`. This is irreversible for originals and should normally be
+used only after preserving the JSON/CSV quality report or the source videos.
+
 The equivalent command with explicit Windows paths is:
 
 ```powershell
@@ -467,9 +492,9 @@ py -3.10 check_skeletons.py data\skeletons_rtmw `
 The `relaxed` retry profile keeps a 10% bbox margin and disables destructive
 temporal removal, which helps distinguish detector loss from post-processing
 loss. It does not overwrite the original files. Add `--replace-if-better` only
-when passing retry results should replace originals; each replaced original is
-first copied under `original_backup` in the retry directory. Here “retry” means
-running skeleton extraction again, not fine-tuning the RTMW model.
+when passing retry results should replace failed originals; each replaced
+original is first copied under `original_backup` in the retry directory. Here
+“retry” means running skeleton extraction again, not fine-tuning the RTMW model.
 
 ## Notes
 

@@ -10,9 +10,13 @@ import numpy as np
 from ntu_rtmw.quality import (
     QualityThresholds,
     build_ntu_zip_index,
+    configure_repair_workflow,
+    delete_failed_skeletons,
+    deletion_summary,
     evaluate_npz,
     locate_archived_video,
     parse_integer_spec,
+    parser as quality_parser,
     reextract_failed,
     scan_skeletons,
 )
@@ -136,6 +140,39 @@ class QualityTests(unittest.TestCase):
             )
             self.assertEqual(records[0]["status"], "skipped_duplicate_copy")
 
+    def test_delete_failed_skeletons_only_deletes_eligible_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / "S001C001P001R001A055_rgb.npz"
+            untouched = root / "S001C001P001R001A056_rgb.npz"
+            passing = root / "S001C001P001R001A001_rgb.npz"
+            write_skeleton(selected, action=55, missing_second=(5, 17))
+            write_skeleton(untouched, action=56, missing_second=(5, 17))
+            write_skeleton(passing, action=1, missing_second=(0, 20))
+            results = [evaluate_npz(path) for path in (selected, untouched, passing)]
+
+            records = delete_failed_skeletons(
+                results,
+                root,
+                eligible_paths=[selected],
+            )
+
+            self.assertFalse(selected.exists())
+            self.assertTrue(untouched.exists())
+            self.assertTrue(passing.exists())
+            self.assertEqual(deletion_summary(records)["deleted"], 1)
+            self.assertEqual(results[0]["deletion"]["status"], "deleted")
+            self.assertNotIn("deletion", results[1])
+
+    def test_repair_yolo26_flag_enables_complete_cleanup_workflow(self):
+        args = configure_repair_workflow(
+            quality_parser().parse_args(["--repair-failed-yolo26"])
+        )
+        self.assertTrue(args.reextract_failed)
+        self.assertEqual(args.retry_det_backend, "yolo26")
+        self.assertTrue(args.replace_if_better)
+        self.assertTrue(args.delete_failed)
+
     def test_locates_video_inside_official_ntu_zip(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -222,6 +259,7 @@ class QualityTests(unittest.TestCase):
             original = skeleton_root / "S001C001P001R001A055_rgb.npz"
             write_skeleton(original, action=55, missing_second=(5, 17))
             result = evaluate_npz(original)
+            result["quality_score"] = 100.0
 
             passing = root / "passing.npz"
             write_skeleton(passing, action=55)
@@ -262,10 +300,12 @@ class QualityTests(unittest.TestCase):
                     retry_yolo_iou=0.70,
                     retry_yolo_imgsz=960,
                     retry_crop_margin=0.10,
+                    replace_if_better=True,
                 )
 
             self.assertEqual(records[0]["status"], "pass", records[0])
             self.assertEqual(records[0]["detector"], "yolo26")
+            self.assertTrue(records[0]["replaced"])
             build_yolo.assert_called_once()
             infer_yolo.assert_called_once()
             retried = retry_output / original.name
@@ -273,6 +313,7 @@ class QualityTests(unittest.TestCase):
                 metadata = json.loads(data["metadata"].item())
             self.assertEqual(metadata["det_model"], "yolo26x")
             self.assertEqual(metadata["det_weights"], str(yolo_model))
+            self.assertEqual(evaluate_npz(original)["status"], "pass")
 
 
 if __name__ == "__main__":

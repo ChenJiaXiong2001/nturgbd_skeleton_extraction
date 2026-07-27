@@ -585,6 +585,64 @@ def report_summary(results):
     }
 
 
+def _is_path_within(path, root):
+    path = Path(path).expanduser().resolve()
+    root = Path(root).expanduser().resolve()
+    if root.is_file():
+        return path == root
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def delete_failed_skeletons(results, input_path, eligible_paths=None):
+    """Delete failed NPZ files, optionally restricted to paths selected for retry."""
+    eligible = None
+    if eligible_paths is not None:
+        eligible = {
+            str(Path(path).expanduser().resolve())
+            for path in eligible_paths
+        }
+
+    records = []
+    for result in results:
+        if result.get("status") == "pass":
+            continue
+        path = Path(result["path"]).expanduser().resolve()
+        if eligible is not None and str(path) not in eligible:
+            continue
+
+        record = {"path": str(path), "status": "error"}
+        if path.suffix.lower() != ".npz":
+            record.update(status="refused", reason="not_an_npz_file")
+        elif not _is_path_within(path, input_path):
+            record.update(status="refused", reason="outside_input_path")
+        else:
+            try:
+                path.unlink()
+                record["status"] = "deleted"
+            except FileNotFoundError:
+                record["status"] = "already_missing"
+            except OSError as exc:
+                record["reason"] = str(exc)
+
+        result["deletion"] = record
+        records.append(record)
+    return records
+
+
+def deletion_summary(records):
+    return {
+        "selected": len(records),
+        "deleted": sum(record["status"] == "deleted" for record in records),
+        "already_missing": sum(record["status"] == "already_missing" for record in records),
+        "refused": sum(record["status"] == "refused" for record in records),
+        "errors": sum(record["status"] == "error" for record in records),
+    }
+
+
 def write_reports(results, thresholds, report_dir, prefix="skeleton_quality"):
     report_dir = Path(report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -598,6 +656,13 @@ def write_reports(results, thresholds, report_dir, prefix="skeleton_quality"):
         "summary": report_summary(results),
         "results": results,
     }
+    deletion_records = [
+        result["deletion"]
+        for result in results
+        if result.get("deletion")
+    ]
+    if deletion_records:
+        payload["deletion_summary"] = deletion_summary(deletion_records)
     json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     fields = [
@@ -614,6 +679,9 @@ def write_reports(results, thresholds, report_dir, prefix="skeleton_quality"):
         "body_complete_rate",
         "large_body_jump_rate",
         "large_slot_jump_rate",
+        "deleted",
+        "deletion_status",
+        "deletion_error",
         "reasons",
         "warnings",
     ]
@@ -623,6 +691,7 @@ def write_reports(results, thresholds, report_dir, prefix="skeleton_quality"):
         for result in results:
             metrics = result.get("metrics", {})
             metadata = result.get("metadata", {})
+            deletion = result.get("deletion", {})
             writer.writerow({
                 "status": result.get("status"),
                 "quality_score": result.get("quality_score"),
@@ -637,6 +706,9 @@ def write_reports(results, thresholds, report_dir, prefix="skeleton_quality"):
                 "body_complete_rate": metrics.get("body_complete_rate"),
                 "large_body_jump_rate": metrics.get("large_body_jump_rate"),
                 "large_slot_jump_rate": metrics.get("large_slot_jump_rate"),
+                "deleted": deletion.get("status") == "deleted",
+                "deletion_status": deletion.get("status"),
+                "deletion_error": deletion.get("reason"),
                 "reasons": "; ".join(result.get("reasons", [])),
                 "warnings": "; ".join(result.get("warnings", [])),
             })
@@ -1001,8 +1073,11 @@ def reextract_failed(
 
                 better = (
                     retried["status"] == "pass"
-                    and float(retried.get("quality_score", 0.0))
-                    > float(original.get("quality_score", 0.0))
+                    and (
+                        original.get("status") != "pass"
+                        or float(retried.get("quality_score", 0.0))
+                        > float(original.get("quality_score", 0.0))
+                    )
                 )
                 record["better"] = better
                 if replace_if_better and better:
@@ -1053,6 +1128,14 @@ def parser():
     p.add_argument("--max-unexpected-person-rate", type=float, default=0.10)
     p.add_argument("--max-unexpected-person-run", type=int, default=10)
     p.add_argument("--reextract-failed", action="store_true")
+    p.add_argument(
+        "--repair-failed-yolo26",
+        action="store_true",
+        help=(
+            "Repair failed samples with YOLO26, replace originals when the retry passes, "
+            "and delete selected originals that still fail."
+        ),
+    )
     p.add_argument("--video-root", default=str(EXTRACTED_DIR))
     p.add_argument(
         "--archives-dir",
@@ -1094,10 +1177,30 @@ def parser():
     p.add_argument(
         "--replace-if-better",
         action="store_true",
-        help="Back up and replace an original only when the retried file passes and scores higher.",
+        help=(
+            "Back up and replace an original when a retry passes and is preferable to the "
+            "original result."
+        ),
+    )
+    p.add_argument(
+        "--delete-failed",
+        action="store_true",
+        help=(
+            "Delete failed original .npz files after quality checks/retries are evaluated. With "
+            "--reextract-failed, only samples selected by --retry-limit are eligible."
+        ),
     )
     p.add_argument("--no-fail-exit", action="store_true")
     return p
+
+
+def configure_repair_workflow(args):
+    if args.repair_failed_yolo26:
+        args.reextract_failed = True
+        args.retry_det_backend = "yolo26"
+        args.replace_if_better = True
+        args.delete_failed = True
+    return args
 
 
 def thresholds_from_args(args):
@@ -1121,7 +1224,7 @@ def thresholds_from_args(args):
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    args = configure_repair_workflow(parser().parse_args(argv))
     thresholds = thresholds_from_args(args)
     input_path = Path(args.input).expanduser().resolve()
     report_dir = Path(args.report_dir).expanduser().resolve()
@@ -1178,6 +1281,18 @@ def main(argv=None):
                         result.clear()
                         result.update(replacement)
                     result["retry"] = record
+
+    deletion_records = []
+    if args.delete_failed:
+        eligible_paths = None
+        if args.reextract_failed:
+            eligible_paths = [record["source_npz"] for record in retry_records]
+        deletion_records = delete_failed_skeletons(
+            results,
+            input_path,
+            eligible_paths=eligible_paths,
+        )
+        print("deletion {}".format(deletion_summary(deletion_records)), flush=True)
 
     json_path, csv_path, failed_path = write_reports(
         results,
