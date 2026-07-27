@@ -17,6 +17,7 @@ from .constants import (
     EXTRACTED_DIR,
     RAW_ARCHIVES_DIR,
     SKELETON_DIR,
+    NTU_INTERACTION_ACTIONS,
     VIDEO_EXTENSIONS,
     YOLO_WEIGHTS_PATH,
 )
@@ -30,7 +31,7 @@ NTU_RGB_ZIP_RE = re.compile(r"nturgb(?:d|\+d)_rgb_s(?P<setup>\d{3})\.zip$", re.I
 
 @dataclass(frozen=True)
 class QualityThresholds:
-    two_person_actions: tuple = tuple(range(50, 61)) + tuple(range(106, 121))
+    two_person_actions: tuple = tuple(sorted(NTU_INTERACTION_ACTIONS))
     default_expected_persons: int = 1
     keypoint_score_threshold: float = 0.1
     presence_body_keypoints: int = 5
@@ -43,6 +44,8 @@ class QualityThresholds:
     max_large_jump_rate: float = 0.02
     slot_jump_ratio: float = 0.50
     max_slot_jump_rate: float = 0.05
+    max_unexpected_person_rate: float = 0.10
+    max_unexpected_person_run: int = 10
     max_score_coordinate_mismatch_rate: float = 0.0
 
 
@@ -226,6 +229,7 @@ def evaluate_npz(path, thresholds=None):
             active = bbox_active & (body_counts >= thresholds.presence_body_keypoints)
             persons_per_frame = active.sum(axis=1)
             missing_expected = persons_per_frame < expected
+            unexpected_people = persons_per_frame > expected
             min_recall = (
                 thresholds.two_person_min_recall
                 if expected >= 2
@@ -233,6 +237,8 @@ def evaluate_npz(path, thresholds=None):
             )
             expected_person_recall = float(np.mean(persons_per_frame >= expected))
             longest_missing = longest_true_run(missing_expected)
+            unexpected_person_rate = float(np.mean(unexpected_people))
+            longest_unexpected_person_run = longest_true_run(unexpected_people)
             no_person_rate = float(np.mean(persons_per_frame == 0))
 
             active_instances = int(active.sum())
@@ -299,6 +305,9 @@ def evaluate_npz(path, thresholds=None):
                 "frames_below_expected_persons": int(missing_expected.sum()),
                 "missing_frame_ranges": compact_ranges(missing_expected),
                 "longest_missing_run": longest_missing,
+                "unexpected_person_rate": unexpected_person_rate,
+                "unexpected_person_frame_ranges": compact_ranges(unexpected_people),
+                "longest_unexpected_person_run": longest_unexpected_person_run,
                 "no_person_rate": no_person_rate,
                 "active_person_instances": active_instances,
                 "body_complete_rate": body_complete_rate,
@@ -344,6 +353,20 @@ def evaluate_npz(path, thresholds=None):
                     "longest_missing_run={} > {}".format(
                         longest_missing,
                         thresholds.max_missing_run,
+                    )
+                )
+            if unexpected_person_rate > thresholds.max_unexpected_person_rate:
+                result["reasons"].append(
+                    "unexpected_person_rate={:.3f}>{:.3f}".format(
+                        unexpected_person_rate,
+                        thresholds.max_unexpected_person_rate,
+                    )
+                )
+            if longest_unexpected_person_run > thresholds.max_unexpected_person_run:
+                result["reasons"].append(
+                    "longest_unexpected_person_run={} > {}".format(
+                        longest_unexpected_person_run,
+                        thresholds.max_unexpected_person_run,
                     )
                 )
             if body_complete_rate < thresholds.min_body_complete_rate:
@@ -586,6 +609,8 @@ def write_reports(results, thresholds, report_dir, prefix="skeleton_quality"):
         "frames",
         "expected_person_recall",
         "longest_missing_run",
+        "unexpected_person_rate",
+        "longest_unexpected_person_run",
         "body_complete_rate",
         "large_body_jump_rate",
         "large_slot_jump_rate",
@@ -607,6 +632,8 @@ def write_reports(results, thresholds, report_dir, prefix="skeleton_quality"):
                 "frames": metrics.get("frames"),
                 "expected_person_recall": metrics.get("expected_person_recall"),
                 "longest_missing_run": metrics.get("longest_missing_run"),
+                "unexpected_person_rate": metrics.get("unexpected_person_rate"),
+                "longest_unexpected_person_run": metrics.get("longest_unexpected_person_run"),
                 "body_complete_rate": metrics.get("body_complete_rate"),
                 "large_body_jump_rate": metrics.get("large_body_jump_rate"),
                 "large_slot_jump_rate": metrics.get("large_slot_jump_rate"),
@@ -939,6 +966,7 @@ def reextract_failed(
                     )
                     video = materialized_video
                 output.parent.mkdir(parents=True, exist_ok=True)
+                args.expected_persons = int(original.get("expected_persons") or 1)
                 arrays = infer_video(inferencer, video, args)
                 metadata_overrides = {
                     "retry_profile": profile,
@@ -1022,6 +1050,8 @@ def parser():
     p.add_argument("--max-large-jump-rate", type=float, default=0.02)
     p.add_argument("--slot-jump-ratio", type=float, default=0.50)
     p.add_argument("--max-slot-jump-rate", type=float, default=0.05)
+    p.add_argument("--max-unexpected-person-rate", type=float, default=0.10)
+    p.add_argument("--max-unexpected-person-run", type=int, default=10)
     p.add_argument("--reextract-failed", action="store_true")
     p.add_argument("--video-root", default=str(EXTRACTED_DIR))
     p.add_argument(
@@ -1085,6 +1115,8 @@ def thresholds_from_args(args):
         max_large_jump_rate=args.max_large_jump_rate,
         slot_jump_ratio=args.slot_jump_ratio,
         max_slot_jump_rate=args.max_slot_jump_rate,
+        max_unexpected_person_rate=args.max_unexpected_person_rate,
+        max_unexpected_person_run=args.max_unexpected_person_run,
     )
 
 

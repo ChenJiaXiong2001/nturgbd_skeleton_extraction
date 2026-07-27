@@ -65,6 +65,18 @@ class QualityTests(unittest.TestCase):
             self.assertEqual(result["status"], "pass", result["reasons"])
             self.assertEqual(result["expected_persons"], 1)
 
+    def test_single_person_sequence_with_stable_extra_person_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "S001C001P001R001A001_rgb.npz"
+            write_skeleton(path, action=1, persons=2)
+            result = evaluate_npz(path)
+            self.assertEqual(result["expected_persons"], 1)
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["metrics"]["unexpected_person_rate"], 1.0)
+            self.assertTrue(
+                any("unexpected_person_rate" in reason for reason in result["reasons"])
+            )
+
     def test_complete_two_person_sequence_passes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "S001C001P001R001A055_rgb.npz"

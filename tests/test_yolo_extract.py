@@ -89,7 +89,7 @@ class YoloExtractTests(unittest.TestCase):
         ):
             arrays = infer_video(
                 (FakeDetector(), object()),
-                Path(directory) / "sample.avi",
+                Path(directory) / "S001C001P001R001A055_rgb.avi",
                 args,
             )
 
@@ -97,6 +97,43 @@ class YoloExtractTests(unittest.TestCase):
         self.assertTrue(np.all(arrays["bbox_scores"][0] > 0))
         self.assertAlmostEqual(float(arrays["keypoints"][0, 0, 0, 0]), 20.0)
         self.assertAlmostEqual(float(arrays["keypoints"][0, 1, 0, 0]), 100.0)
+
+    def test_infer_video_keeps_only_one_person_for_single_person_action(self):
+        fake_cv2 = types.ModuleType("cv2")
+        fake_cv2.VideoCapture = FakeCapture
+        fake_mmpose = types.ModuleType("mmpose")
+        fake_apis = types.ModuleType("mmpose.apis")
+        fake_apis.inference_topdown = lambda *_args, **_kwargs: [FakePoseSample()]
+        fake_mmpose.apis = fake_apis
+        args = Namespace(
+            bbox_thr=0.15,
+            kpt_thr=0.1,
+            max_persons=2,
+            tracking_distance=150.0,
+            crop_margin=0.0,
+            filter_output_to_bbox=False,
+            filter_output_to_frame=False,
+            temporal_min_frames=1,
+            temporal_max_jump=0.0,
+            temporal_min_keypoints=0,
+        )
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules,
+            {
+                "cv2": fake_cv2,
+                "mmpose": fake_mmpose,
+                "mmpose.apis": fake_apis,
+            },
+        ):
+            arrays = infer_video(
+                (FakeDetector(), object()),
+                Path(directory) / "S001C001P001R001A001_rgb.avi",
+                args,
+            )
+
+        self.assertGreater(float(arrays["bbox_scores"][0, 0]), 0.0)
+        self.assertEqual(float(arrays["bbox_scores"][0, 1]), 0.0)
 
 
 if __name__ == "__main__":

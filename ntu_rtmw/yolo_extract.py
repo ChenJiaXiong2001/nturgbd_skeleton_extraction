@@ -3,7 +3,13 @@
 from pathlib import Path
 
 from .camera import YoloPersonDetector, find_rtmw_config_path
-from .extract import assign_slots, postprocess_arrays, require_numpy, select_instances
+from .extract import (
+    assign_slots,
+    expected_person_limit,
+    postprocess_arrays,
+    require_numpy,
+    select_instances,
+)
 
 
 def ensure_ready():
@@ -109,6 +115,7 @@ def infer_video(inferencer, video, args):
     bbox_scores = []
     previous = None
     frame_idx = 0
+    person_limit = expected_person_limit(video, args)
     try:
         while True:
             ok, frame = cap.read()
@@ -119,7 +126,7 @@ def infer_video(inferencer, video, args):
                 detections = detections[detections[:, 4] >= float(args.bbox_thr)]
                 if len(detections):
                     order = np.argsort(-detections[:, 4])
-                    detections = detections[order[: int(args.max_persons)]]
+                    detections = detections[order[:person_limit]]
 
             raw_instances = []
             for detection in detections:

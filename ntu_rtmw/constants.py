@@ -13,6 +13,7 @@ MODELS_DIR = PROJECT_ROOT / "models"
 VIDEO_EXTENSIONS = {".avi", ".mp4", ".mov", ".mkv"}
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz"}
 NTU_RGB_ARCHIVE_NAMES = ["nturgbd_rgb_s{:03d}.zip".format(i) for i in range(1, 33)]
+NTU_INTERACTION_ACTIONS = frozenset(range(50, 61)) | frozenset(range(106, 121))
 
 NTU_NAME_RE = re.compile(
     r"S(?P<setup>\d{3})C(?P<camera>\d{3})P(?P<subject>\d{3})"

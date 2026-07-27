@@ -15,6 +15,7 @@ from .constants import (
     RTMW_CONFIG,
     RTMW_WEIGHTS_PATH,
     VIDEO_EXTENSIONS,
+    NTU_INTERACTION_ACTIONS,
 )
 from .device import resolve_device
 from .download import ensure_rtmdet_weights, ensure_rtmw_weights
@@ -100,6 +101,18 @@ def find_videos(root, pattern="*_rgb.avi", all_videos=False):
 def ntu_metadata(path):
     match = NTU_NAME_RE.search(Path(path).stem)
     return {k: int(v) for k, v in match.groupdict().items()} if match else {}
+
+
+def expected_person_limit(video, args):
+    """Return how many active person tracks should be retained for a video."""
+    explicit = getattr(args, "expected_persons", None)
+    if explicit is not None:
+        return max(1, min(int(args.max_persons), int(explicit)))
+    action = ntu_metadata(video).get("action")
+    if action is None:
+        return int(args.max_persons)
+    expected = 2 if action in NTU_INTERACTION_ACTIONS else 1
+    return max(1, min(int(args.max_persons), expected))
 
 
 def output_path(video, input_root, output_root):
@@ -449,6 +462,7 @@ def infer_video(inferencer, video, args):
     keypoints, scores, bboxes, bbox_scores = [], [], [], []
     previous = None
     num_kpts = 133
+    person_limit = expected_person_limit(video, args)
     visualizer = SkeletonVisualizer(video, args)
     display_filter = TemporalDisplayFilter(
         getattr(args, "temporal_min_frames", 1),
@@ -463,6 +477,7 @@ def infer_video(inferencer, video, args):
     try:
         for frame_idx, result in enumerate(inferencer(str(video), **kwargs)):
             items = select_instances(unwrap_predictions(result), args.bbox_thr, args.kpt_thr)
+            items = items[:person_limit]
             for item in items:
                 if item["keypoints"].shape[0]:
                     num_kpts = int(item["keypoints"].shape[0])
@@ -623,6 +638,7 @@ def save_npz(path, video, arrays, args, metadata_overrides=None):
         "pose_weights": args.pose2d_weights,
         "det_model": args.det_model,
         "det_weights": getattr(args, "det_weights", None),
+        "expected_persons": expected_person_limit(video, args),
         "keypoint_convention": "coco_wholebody_133",
         "max_persons": args.max_persons,
     })

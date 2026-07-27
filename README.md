@@ -376,11 +376,18 @@ py -3.10 check_skeletons.py data\skeletons_rtmw
 The default rules expect one person for ordinary actions and two people for
 NTU interaction actions A050-A060 and A106-A120. The checker validates the array structure, continuous
 frame indices, expected-person recall, longest missing-person run, valid body
-keypoints, normalized frame-to-frame body/slot jumps, and duplicate NTU sample
+keypoints, unexpected extra people in single-person actions, normalized
+frame-to-frame body/slot jumps, and duplicate NTU sample
 IDs. When duplicates exist, the passing RTMDet result with the highest quality
 score is preferred and the extra copies fail the check. A failed scan exits
 with status code 1 so it can stop a training pipeline. Add `--no-fail-exit` when
 only a report is needed.
+
+For single-person actions, a second active skeleton is allowed for at most 10%
+of frames and no more than 10 consecutive frames. Override these safeguards
+with `--max-unexpected-person-rate` and `--max-unexpected-person-run`. New
+extraction and retry runs also retain at most one active track for single-person
+actions while preserving two array slots for downstream shape compatibility.
 
 Useful threshold overrides:
 
