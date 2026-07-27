@@ -1,13 +1,17 @@
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from ntu_rtmw.quality import (
     QualityThresholds,
+    build_ntu_zip_index,
     evaluate_npz,
+    locate_archived_video,
     parse_integer_spec,
     reextract_failed,
     scan_skeletons,
@@ -119,6 +123,84 @@ class QualityTests(unittest.TestCase):
                 root / "retry",
             )
             self.assertEqual(records[0]["status"], "skipped_duplicate_copy")
+
+    def test_locates_video_inside_official_ntu_zip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = root / "raw_archives"
+            archives.mkdir()
+            archive = archives / "nturgbd_rgb_s001.zip"
+            member = "nturgb+d_rgb/S001C001P001R001A055_rgb.avi"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr(member, b"video-bytes")
+
+            result = {
+                "path": str(root / "S001C001P001R001A055_rgb.npz"),
+                "metadata": {
+                    "setup": 1,
+                    "video_name": "S001C001P001R001A055_rgb.avi",
+                },
+            }
+            source = locate_archived_video(result, build_ntu_zip_index(archives), {})
+            self.assertEqual(source, (archive, member))
+
+    def test_retry_uses_one_video_from_zip_without_expanded_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skeleton_root = root / "skeletons"
+            skeleton_root.mkdir()
+            original = skeleton_root / "S001C001P001R001A055_rgb.npz"
+            write_skeleton(original, action=55, missing_second=(5, 17))
+            result = evaluate_npz(original)
+            self.assertEqual(result["status"], "fail")
+
+            passing = root / "passing.npz"
+            write_skeleton(passing, action=55)
+            with np.load(passing, allow_pickle=False) as data:
+                arrays = {
+                    key: data[key]
+                    for key in ("keypoints", "scores", "bboxes", "bbox_scores", "frame_indices")
+                }
+
+            archives = root / "raw_archives"
+            archives.mkdir()
+            archive = archives / "nturgbd_rgb_s001.zip"
+            member = "nturgb+d_rgb/S001C001P001R001A055_rgb.avi"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr(member, b"video-bytes")
+
+            retry_output = root / "retry"
+            retry_temp = root / "retry_temp"
+            with (
+                patch("ntu_rtmw.extract.ensure_supported_python"),
+                patch("ntu_rtmw.extract.ensure_openmmlab_ready"),
+                patch("ntu_rtmw.extract.configure_cpu_threads"),
+                patch("ntu_rtmw.extract.build_inferencer", return_value=object()),
+                patch("ntu_rtmw.extract.infer_video", return_value=arrays),
+                patch("ntu_rtmw.download.ensure_rtmw_weights", return_value=root / "pose.pth"),
+                patch("ntu_rtmw.download.ensure_rtmdet_weights", return_value=root / "det.pth"),
+            ):
+                records = reextract_failed(
+                    [result],
+                    QualityThresholds(),
+                    skeleton_root,
+                    root / "extracted",
+                    retry_output,
+                    device="cpu",
+                    archives_dir=archives,
+                    retry_temp_dir=retry_temp,
+                )
+
+            self.assertEqual(records[0]["status"], "pass", records[0])
+            self.assertEqual(records[0]["source_archive_member"], member)
+            retried = retry_output / original.name
+            self.assertTrue(retried.exists())
+            with np.load(retried, allow_pickle=False) as data:
+                metadata = json.loads(data["metadata"].item())
+            self.assertEqual(metadata["video_name"], original.with_suffix(".avi").name)
+            self.assertEqual(metadata["video_archive"], str(archive.resolve()))
+            self.assertEqual(metadata["video_archive_member"], member)
+            self.assertEqual(list(retry_temp.iterdir()), [])
 
 
 if __name__ == "__main__":

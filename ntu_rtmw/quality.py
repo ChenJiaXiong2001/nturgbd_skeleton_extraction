@@ -1,19 +1,24 @@
 import argparse
 import csv
 import json
+import re
 import shutil
 import sys
+import tempfile
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from .constants import DATA_DIR, EXTRACTED_DIR, SKELETON_DIR, VIDEO_EXTENSIONS
+from .constants import DATA_DIR, EXTRACTED_DIR, RAW_ARCHIVES_DIR, SKELETON_DIR, VIDEO_EXTENSIONS
 from .manifest import meta_from_path
 
 
 REQUIRED_ARRAYS = ("keypoints", "scores", "bboxes", "bbox_scores", "frame_indices")
 BODY_KEYPOINTS = 17
+NTU_RGB_ZIP_RE = re.compile(r"nturgb(?:d|\+d)_rgb_s(?P<setup>\d{3})\.zip$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -357,7 +362,11 @@ def evaluate_npz(path, thresholds=None):
                 )
 
             video_path = result["metadata"].get("video_path")
-            if video_path and not Path(str(video_path)).exists():
+            video_archive = result["metadata"].get("video_archive")
+            archive_available = bool(video_archive) and Path(str(video_archive)).exists()
+            if video_archive and not archive_available:
+                result["warnings"].append("metadata_video_archive_not_found")
+            if video_path and not Path(str(video_path)).exists() and not archive_available:
                 result["warnings"].append("metadata_video_path_not_found")
 
             recall_component = min(1.0, expected_person_recall / max(min_recall, 1e-9))
@@ -650,6 +659,89 @@ def locate_source_video(result, skeleton_root, video_root, video_index):
     return None
 
 
+def build_ntu_zip_index(archives_root):
+    """Map NTU setup numbers to official RGB ZIP archives."""
+    archives_root = Path(archives_root)
+    if not archives_root.exists():
+        return {}
+    index = {}
+    for archive in archives_root.rglob("*"):
+        if not archive.is_file() or archive.suffix.lower() != ".zip":
+            continue
+        match = NTU_RGB_ZIP_RE.fullmatch(archive.name)
+        if match:
+            index[int(match.group("setup"))] = archive
+    return index
+
+
+def _result_setup(result):
+    metadata = result.get("metadata", {})
+    setup = metadata.get("setup")
+    if setup is None:
+        filename_meta = meta_from_path(result.get("path", "")) or {}
+        setup = filename_meta.get("setup")
+    try:
+        return int(setup)
+    except (TypeError, ValueError):
+        return None
+
+
+def _result_video_keys(result):
+    metadata = result.get("metadata", {})
+    skeleton_path = Path(result.get("path", "skeleton.npz"))
+    video_name = metadata.get("video_name")
+    keys = []
+    if video_name:
+        keys.extend((Path(str(video_name)).name.lower(), Path(str(video_name)).stem.lower()))
+    keys.append(skeleton_path.stem.lower())
+    return tuple(dict.fromkeys(keys))
+
+
+def locate_archived_video(result, archive_index, member_cache=None):
+    """Return ``(zip_path, member_name)`` for an NTU sample, if available."""
+    setup = _result_setup(result)
+    archive = archive_index.get(setup)
+    if archive is None:
+        return None
+
+    member_cache = member_cache if member_cache is not None else {}
+    member_index = member_cache.get(archive)
+    if member_index is None:
+        member_index = {}
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    member_path = PurePosixPath(info.filename.replace("\\", "/"))
+                    if member_path.suffix.lower() not in VIDEO_EXTENSIONS:
+                        continue
+                    member_index.setdefault(member_path.name.lower(), []).append(info.filename)
+                    member_index.setdefault(member_path.stem.lower(), []).append(info.filename)
+        except (OSError, zipfile.BadZipFile):
+            member_index = {}
+        member_cache[archive] = member_index
+
+    for key in _result_video_keys(result):
+        matches = list(dict.fromkeys(member_index.get(key, [])))
+        if len(matches) == 1:
+            return archive, matches[0]
+    return None
+
+
+def _materialize_archive_video(source, temp_root, handles, stack, token):
+    archive, member = source
+    zf = handles.get(archive)
+    if zf is None:
+        zf = stack.enter_context(zipfile.ZipFile(archive))
+        handles[archive] = zf
+    video_name = PurePosixPath(member.replace("\\", "/")).name
+    target = Path(temp_root) / "{:06d}_{}".format(token, video_name)
+    with zf.open(member) as source_stream, target.open("wb") as target_stream:
+        shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
+    return target
+
+
 def _retry_relative_path(result, skeleton_root):
     path = Path(result["path"])
     skeleton_root = Path(skeleton_root)
@@ -673,6 +765,9 @@ def reextract_failed(
     cpu_threads=0,
     retry_limit=None,
     replace_if_better=False,
+    archives_dir=None,
+    retry_from_archives=True,
+    retry_temp_dir=None,
 ):
     failed = [result for result in results if result["status"] != "pass"]
     if retry_limit is not None:
@@ -684,6 +779,12 @@ def reextract_failed(
     retry_output = Path(retry_output)
     retry_output.mkdir(parents=True, exist_ok=True)
     video_index = build_video_index(video_root)
+    archive_index = (
+        build_ntu_zip_index(archives_dir)
+        if retry_from_archives and archives_dir is not None
+        else {}
+    )
+    archive_member_cache = {}
 
     retry_jobs = []
     retry_records = []
@@ -700,16 +801,19 @@ def reextract_failed(
             })
             continue
         video = locate_source_video(result, skeleton_root, video_root, video_index)
+        archive_source = None
+        if video is None and archive_index:
+            archive_source = locate_archived_video(result, archive_index, archive_member_cache)
         relative = _retry_relative_path(result, skeleton_root)
         output = retry_output / relative
-        if video is None:
+        if video is None and archive_source is None:
             retry_records.append({
                 "source_npz": result["path"],
                 "status": "video_not_found",
                 "retry_npz": str(output.resolve()),
             })
             continue
-        retry_jobs.append((result, video, output, relative))
+        retry_jobs.append((result, video, archive_source, output, relative))
 
     if not retry_jobs:
         return retry_records
@@ -723,7 +827,7 @@ def reextract_failed(
     extract.ensure_openmmlab_ready()
     parser = extract.parser()
     args = parser.parse_args([
-        "--input", str(retry_jobs[0][1]),
+        "--input", str(video_root),
         "--output", str(retry_output),
         "--device", str(device),
         "--workers", "1",
@@ -756,41 +860,84 @@ def reextract_failed(
     print("retry device {} profile {}".format(args.device, profile), flush=True)
     inferencer = extract.build_inferencer(args)
 
-    for index, (original, video, output, relative) in enumerate(retry_jobs, 1):
-        record = {
-            "source_npz": original["path"],
-            "source_video": str(video.resolve()),
-            "retry_npz": str(output.resolve()),
-            "profile": profile,
-            "status": "error",
-        }
-        print("retry [{}/{}] {}".format(index, len(retry_jobs), video), flush=True)
-        try:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            arrays = extract.infer_video(inferencer, video, args)
-            extract.save_npz(output, video, arrays, args)
-            retried = evaluate_npz(output, thresholds)
-            record["result"] = retried
-            record["status"] = retried["status"]
+    temp_parent = Path(retry_temp_dir).expanduser() if retry_temp_dir else None
+    if temp_parent is not None:
+        temp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="ntu_rtmw_retry_",
+        dir=str(temp_parent) if temp_parent is not None else None,
+    ) as temp_name, ExitStack() as stack:
+        archive_handles = {}
+        for index, (original, video, archive_source, output, relative) in enumerate(retry_jobs, 1):
+            archived = archive_source is not None
+            source_label = str(video.resolve()) if video is not None else "{}!{}".format(*archive_source)
+            record = {
+                "source_npz": original["path"],
+                "source_video": source_label,
+                "retry_npz": str(output.resolve()),
+                "profile": profile,
+                "status": "error",
+            }
+            if archived:
+                record["source_archive"] = str(archive_source[0].resolve())
+                record["source_archive_member"] = archive_source[1]
+            print("retry [{}/{}] {}".format(index, len(retry_jobs), source_label), flush=True)
+            materialized_video = None
+            try:
+                if archived:
+                    materialized_video = _materialize_archive_video(
+                        archive_source,
+                        temp_name,
+                        archive_handles,
+                        stack,
+                        index,
+                    )
+                    video = materialized_video
+                output.parent.mkdir(parents=True, exist_ok=True)
+                arrays = extract.infer_video(inferencer, video, args)
+                metadata_overrides = None
+                if archived:
+                    metadata_overrides = {
+                        "video_name": PurePosixPath(
+                            archive_source[1].replace("\\", "/")
+                        ).name,
+                        "video_path": None,
+                        "video_archive": str(archive_source[0].resolve()),
+                        "video_archive_member": archive_source[1],
+                    }
+                extract.save_npz(
+                    output,
+                    video,
+                    arrays,
+                    args,
+                    metadata_overrides=metadata_overrides,
+                )
+                retried = evaluate_npz(output, thresholds)
+                record["result"] = retried
+                record["status"] = retried["status"]
 
-            better = (
-                retried["status"] == "pass"
-                and float(retried.get("quality_score", 0.0)) > float(original.get("quality_score", 0.0))
-            )
-            record["better"] = better
-            if replace_if_better and better:
-                original_path = Path(original["path"])
-                backup = retry_output / "original_backup" / relative
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(original_path, backup)
-                shutil.copy2(output, original_path)
-                record["replaced"] = True
-                record["backup"] = str(backup.resolve())
-            else:
-                record["replaced"] = False
-        except Exception as exc:
-            record["error"] = str(exc)
-        retry_records.append(record)
+                better = (
+                    retried["status"] == "pass"
+                    and float(retried.get("quality_score", 0.0))
+                    > float(original.get("quality_score", 0.0))
+                )
+                record["better"] = better
+                if replace_if_better and better:
+                    original_path = Path(original["path"])
+                    backup = retry_output / "original_backup" / relative
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(original_path, backup)
+                    shutil.copy2(output, original_path)
+                    record["replaced"] = True
+                    record["backup"] = str(backup.resolve())
+                else:
+                    record["replaced"] = False
+            except Exception as exc:
+                record["error"] = str(exc)
+            finally:
+                if materialized_video is not None:
+                    materialized_video.unlink(missing_ok=True)
+            retry_records.append(record)
     return retry_records
 
 
@@ -822,6 +969,21 @@ def parser():
     p.add_argument("--max-slot-jump-rate", type=float, default=0.05)
     p.add_argument("--reextract-failed", action="store_true")
     p.add_argument("--video-root", default=str(EXTRACTED_DIR))
+    p.add_argument(
+        "--archives-dir",
+        default=str(RAW_ARCHIVES_DIR),
+        help="NTU RGB ZIP directory used when expanded source videos are missing.",
+    )
+    p.add_argument(
+        "--retry-from-archives",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fall back to one-video-at-a-time temporary extraction from NTU ZIP archives.",
+    )
+    p.add_argument(
+        "--retry-temp-dir",
+        help="Parent for one-video temporary files. On Linux use /dev/shm to keep them in RAM.",
+    )
     p.add_argument("--retry-output", default=str(DATA_DIR / "skeletons_rtmw_retry"))
     p.add_argument("--retry-profile", choices=["standard", "relaxed"], default="relaxed")
     p.add_argument("--retry-limit", type=int)
@@ -861,12 +1023,15 @@ def main(argv=None):
     input_path = Path(args.input).expanduser().resolve()
     report_dir = Path(args.report_dir).expanduser().resolve()
     video_root = Path(args.video_root).expanduser().resolve()
+    archives_dir = Path(args.archives_dir).expanduser().resolve()
     retry_output = Path(args.retry_output).expanduser().resolve()
     print("project paths", flush=True)
     print("  skeletons {}".format(input_path), flush=True)
     print("  reports   {}".format(report_dir), flush=True)
     if args.reextract_failed:
         print("  videos    {}".format(video_root), flush=True)
+        if args.retry_from_archives:
+            print("  archives  {}".format(archives_dir), flush=True)
         print("  retry     {}".format(retry_output), flush=True)
     print("checking {}".format(input_path), flush=True)
     results = scan_skeletons(input_path, thresholds, args.workers, show_progress=True)
@@ -887,6 +1052,9 @@ def main(argv=None):
             cpu_threads=args.cpu_threads,
             retry_limit=args.retry_limit,
             replace_if_better=args.replace_if_better,
+            archives_dir=archives_dir,
+            retry_from_archives=args.retry_from_archives,
+            retry_temp_dir=args.retry_temp_dir,
         )
         if retry_records:
             for result in results:

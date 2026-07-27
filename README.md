@@ -404,6 +404,25 @@ python check_skeletons.py \
   --device cuda:0
 ```
 
+Expanded videos are not required. If a recorded video path is missing, the
+checker automatically finds the corresponding
+`data/raw_archives/nturgbd_rgb_sXXX.zip`, copies only that failed sample's AVI
+to a temporary location, retries skeleton extraction, and immediately deletes
+the temporary AVI. It never expands a complete NTU archive. On Ubuntu, put the
+single temporary AVI in RAM instead of persistent storage with:
+
+```bash
+python check_skeletons.py \
+  --reextract-failed \
+  --archives-dir data/raw_archives \
+  --retry-temp-dir /dev/shm \
+  --retry-profile relaxed \
+  --device cuda:0
+```
+
+Archive fallback is enabled by default. Use `--no-retry-from-archives` to
+require already expanded videos under `data/extracted`.
+
 The equivalent command with explicit Windows paths is:
 
 ```powershell

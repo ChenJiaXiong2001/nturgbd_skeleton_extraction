@@ -611,7 +611,7 @@ def draw_skeleton(frame, keypoints, scores, bboxes, bbox_scores, kpt_thr, cv2):
                 cv2.circle(frame, tuple(point.astype(int).tolist()), 2, color, -1, lineType=cv2.LINE_AA)
 
 
-def save_npz(path, video, arrays, args):
+def save_npz(path, video, arrays, args, metadata_overrides=None):
     require_numpy()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -625,6 +625,8 @@ def save_npz(path, video, arrays, args):
         "keypoint_convention": "coco_wholebody_133",
         "max_persons": args.max_persons,
     })
+    if metadata_overrides:
+        meta.update(metadata_overrides)
     np.savez_compressed(path, metadata=json.dumps(meta, ensure_ascii=False), **arrays)
 
 
