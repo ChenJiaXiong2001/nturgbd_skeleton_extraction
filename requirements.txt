@@ -8,4 +8,4 @@ pycocotools>=2.0.7
 mmcv
 mmdet
 mmpose
-ultralytics
+ultralytics>=8.4.0

@@ -243,18 +243,18 @@ py -3.10 compare_backends.py `
 ```
 
 Both variants use the same crop and RTMW-L pose inference code. The only
-changed variable is whether person boxes come from `models/yolov8n.pt` or the
+changed variable is whether person boxes come from `models/yolo26x.pt` or the
 RTMDet detector used by the standard OpenMMLab pipeline.
 The comparison command supports striding for quick diagnostics, but skeleton
 files used for training are produced by the main extraction pipeline without
 frame sampling. Missing detections remain as zero/NaN entries at their original
 frame positions rather than shortening the sequence.
 
-The camera path uses YOLOv8n for person boxes by default, then sends those
+The camera path uses YOLO26-X for person boxes by default, then sends those
 boxes to RTMW for whole-body keypoints. The YOLO checkpoint is kept at:
 
 ```text
-models/yolov8n.pt
+models/yolo26x.pt
 ```
 
 Useful camera options:
@@ -342,6 +342,52 @@ least two consecutive frames, one-frame position jumps over 150 pixels are
 removed, and person detections with fewer than five valid body keypoints are
 hidden. Tune this with `--temporal-min-frames`, `--temporal-max-jump`, and
 `--temporal-min-keypoints` if you need stricter or looser previews.
+
+## Skeleton Quality Check and Retry
+
+Check every saved skeleton and write JSON, CSV, and a failed-file list:
+
+```powershell
+py -3.10 check_skeletons.py data\skeletons_rtmw
+```
+
+The default rules expect one person for ordinary actions and two people for
+NTU actions A050-A060. The checker validates the array structure, continuous
+frame indices, expected-person recall, longest missing-person run, valid body
+keypoints, and normalized frame-to-frame body/slot jumps. A failed scan exits
+with status code 1 so it can stop a training pipeline. Add `--no-fail-exit`
+when only a report is needed.
+
+Useful threshold overrides:
+
+```powershell
+py -3.10 check_skeletons.py data\skeletons_rtmw `
+  --two-person-min-recall 0.9 `
+  --max-missing-run 8 `
+  --max-large-jump-rate 0.02
+```
+
+Additional NTU120 two-person labels can be supplied as ranges or individual
+actions, for example `--two-person-actions 50-60,106-110`.
+
+Failed files can be re-extracted from their source videos into a separate
+directory:
+
+```powershell
+py -3.10 check_skeletons.py data\skeletons_rtmw `
+  --reextract-failed `
+  --video-root data\extracted `
+  --retry-output data\skeletons_rtmw_retry `
+  --retry-profile relaxed `
+  --device cuda:0
+```
+
+The `relaxed` retry profile keeps a 10% bbox margin and disables destructive
+temporal removal, which helps distinguish detector loss from post-processing
+loss. It does not overwrite the original files. Add `--replace-if-better` only
+when passing retry results should replace originals; each replaced original is
+first copied under `original_backup` in the retry directory. Here “retry” means
+running skeleton extraction again, not fine-tuning the RTMW model.
 
 ## Notes
 
