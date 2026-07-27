@@ -1,13 +1,14 @@
 import argparse
 import csv
 import json
+import multiprocessing
 import re
 import shutil
 import sys
 import tempfile
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -859,6 +860,284 @@ def _retry_relative_path(result, skeleton_root):
     return Path(path.name)
 
 
+def _build_retry_runtime(args, retry_det_backend):
+    if retry_det_backend == "yolo26":
+        from . import yolo_extract
+
+        yolo_extract.ensure_ready()
+        return yolo_extract.build_inferencer(args), yolo_extract.infer_video
+
+    if retry_det_backend == "rtmdet":
+        from . import extract
+
+        extract.ensure_openmmlab_ready()
+        return extract.build_inferencer(args), extract.infer_video
+
+    raise ValueError("Unknown retry detector backend: {}".format(retry_det_backend))
+
+
+def _process_retry_job(
+    job,
+    inferencer,
+    infer_video,
+    args,
+    thresholds,
+    profile,
+    retry_det_backend,
+    retry_output,
+    replace_if_better,
+    temp_name,
+    archive_handles,
+    stack,
+):
+    index, total, original, video, archive_source, output, relative = job
+    video = Path(video) if video is not None else None
+    archive_source = (
+        (Path(archive_source[0]), archive_source[1])
+        if archive_source is not None
+        else None
+    )
+    output = Path(output)
+    relative = Path(relative)
+    archived = archive_source is not None
+    source_label = (
+        str(video.resolve())
+        if video is not None
+        else "{}!{}".format(*archive_source)
+    )
+    record = {
+        "source_npz": original["path"],
+        "source_video": source_label,
+        "retry_npz": str(output.resolve()),
+        "profile": profile,
+        "detector": retry_det_backend,
+        "status": "error",
+    }
+    if archived:
+        record["source_archive"] = str(archive_source[0].resolve())
+        record["source_archive_member"] = archive_source[1]
+    print("retry [{}/{}] {}".format(index, total, source_label), flush=True)
+    materialized_video = None
+    try:
+        if archived:
+            materialized_video = _materialize_archive_video(
+                archive_source,
+                temp_name,
+                archive_handles,
+                stack,
+                index,
+            )
+            video = materialized_video
+        output.parent.mkdir(parents=True, exist_ok=True)
+        args.expected_persons = int(original.get("expected_persons") or 1)
+        arrays = infer_video(inferencer, video, args)
+        metadata_overrides = {
+            "retry_profile": profile,
+            "retry_detector": retry_det_backend,
+        }
+        if retry_det_backend == "yolo26":
+            metadata_overrides.update({
+                "yolo_conf": args.yolo_conf,
+                "yolo_iou": args.yolo_iou,
+                "yolo_imgsz": args.yolo_imgsz,
+                "crop_margin": args.crop_margin,
+            })
+        if archived:
+            metadata_overrides.update({
+                "video_name": PurePosixPath(
+                    archive_source[1].replace("\\", "/")
+                ).name,
+                "video_path": None,
+                "video_archive": str(archive_source[0].resolve()),
+                "video_archive_member": archive_source[1],
+            })
+
+        from . import extract
+
+        extract.save_npz(
+            output,
+            video,
+            arrays,
+            args,
+            metadata_overrides=metadata_overrides,
+        )
+        retried = evaluate_npz(output, thresholds)
+        record["result"] = retried
+        record["status"] = retried["status"]
+
+        better = (
+            retried["status"] == "pass"
+            and (
+                original.get("status") != "pass"
+                or float(retried.get("quality_score", 0.0))
+                > float(original.get("quality_score", 0.0))
+            )
+        )
+        record["better"] = better
+        if replace_if_better and better:
+            original_path = Path(original["path"])
+            backup = Path(retry_output) / "original_backup" / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(original_path, backup)
+            shutil.copy2(output, original_path)
+            record["replaced"] = True
+            record["backup"] = str(backup.resolve())
+        else:
+            record["replaced"] = False
+    except Exception as exc:
+        record["error"] = str(exc)
+    finally:
+        if materialized_video is not None:
+            materialized_video.unlink(missing_ok=True)
+    return record
+
+
+def _run_retry_queued_worker(
+    worker_id,
+    worker_kind,
+    job_queue,
+    args,
+    thresholds,
+    profile,
+    retry_det_backend,
+    retry_output,
+    replace_if_better,
+    retry_temp_dir,
+):
+    from . import extract
+
+    extract.configure_cpu_threads(args)
+    inferencer, infer_video = _build_retry_runtime(args, retry_det_backend)
+    temp_parent = Path(retry_temp_dir).expanduser() if retry_temp_dir else None
+    records = []
+    with tempfile.TemporaryDirectory(
+        prefix="ntu_rtmw_retry_{}_{}_".format(worker_kind.lower(), worker_id),
+        dir=str(temp_parent) if temp_parent is not None else None,
+    ) as temp_name, ExitStack() as stack:
+        archive_handles = {}
+        while True:
+            job = job_queue.get()
+            if job is None:
+                break
+            records.append(_process_retry_job(
+                job,
+                inferencer,
+                infer_video,
+                args,
+                thresholds,
+                profile,
+                retry_det_backend,
+                retry_output,
+                replace_if_better,
+                temp_name,
+                archive_handles,
+                stack,
+            ))
+    return records
+
+
+def run_parallel_retry_workers(
+    retry_jobs,
+    args,
+    thresholds,
+    profile,
+    retry_det_backend,
+    retry_output,
+    replace_if_better,
+    retry_temp_dir,
+    gpu_workers=1,
+    cpu_workers=0,
+    cpu_worker_threads=4,
+    cpu_pose_batch_size=1,
+):
+    """Run retry inference on CUDA and CPU workers sharing one dynamic queue."""
+    gpu_workers = min(max(1, int(gpu_workers or 1)), len(retry_jobs))
+    device_is_cuda = str(args.device).lower().startswith("cuda")
+    requested_cpu_workers = max(0, int(cpu_workers or 0))
+    if requested_cpu_workers and not device_is_cuda:
+        print(
+            "retry CPU hybrid workers disabled because the primary device is not CUDA",
+            flush=True,
+        )
+        requested_cpu_workers = 0
+    cpu_workers = min(
+        requested_cpu_workers,
+        max(0, len(retry_jobs) - gpu_workers),
+    )
+    total_workers = gpu_workers + cpu_workers
+    if total_workers <= 1:
+        print(
+            "retry workers: 1 {} + 0 CPU (single process)".format(
+                "GPU" if device_is_cuda else "PRIMARY"
+            ),
+            flush=True,
+        )
+        return None
+
+    gpu_args = argparse.Namespace(**vars(args))
+    cpu_args = argparse.Namespace(**vars(args))
+    cpu_args.device = "cpu"
+    cpu_args.cpu_threads = max(1, int(cpu_worker_threads or 4))
+    cpu_args.pose_batch_size = max(1, int(cpu_pose_batch_size or 1))
+
+    print(
+        "retry hybrid workers: {} GPU + {} CPU (dynamic queue, spawn)".format(
+            gpu_workers,
+            cpu_workers,
+        ),
+        flush=True,
+    )
+    queued_jobs = [
+        (index, len(retry_jobs), *job)
+        for index, job in enumerate(retry_jobs, 1)
+    ]
+    mp_context = multiprocessing.get_context("spawn")
+    with mp_context.Manager() as manager:
+        job_queue = manager.Queue()
+        for job in queued_jobs:
+            job_queue.put(job)
+        for _ in range(total_workers):
+            job_queue.put(None)
+
+        records = []
+        with ProcessPoolExecutor(
+            max_workers=total_workers,
+            mp_context=mp_context,
+        ) as executor:
+            futures = []
+            for worker_id in range(1, gpu_workers + 1):
+                futures.append(executor.submit(
+                    _run_retry_queued_worker,
+                    worker_id,
+                    "GPU" if device_is_cuda else "PRIMARY",
+                    job_queue,
+                    gpu_args,
+                    thresholds,
+                    profile,
+                    retry_det_backend,
+                    retry_output,
+                    replace_if_better,
+                    retry_temp_dir,
+                ))
+            for worker_id in range(1, cpu_workers + 1):
+                futures.append(executor.submit(
+                    _run_retry_queued_worker,
+                    worker_id,
+                    "CPU",
+                    job_queue,
+                    cpu_args,
+                    thresholds,
+                    profile,
+                    retry_det_backend,
+                    retry_output,
+                    replace_if_better,
+                    retry_temp_dir,
+                ))
+            for future in as_completed(futures):
+                records.extend(future.result())
+    return records
+
+
 def reextract_failed(
     results,
     thresholds,
@@ -881,6 +1160,10 @@ def reextract_failed(
     retry_yolo_iou=0.70,
     retry_yolo_imgsz=960,
     retry_crop_margin=0.10,
+    retry_gpu_workers=1,
+    retry_cpu_workers=0,
+    retry_cpu_worker_threads=4,
+    retry_cpu_pose_batch_size=1,
 ):
     failed = [result for result in results if result["status"] != "pass"]
     if retry_limit is not None:
@@ -965,7 +1248,6 @@ def reextract_failed(
         args.pose2d_weights = str(
             RTMW_WEIGHTS_PATH if Path(RTMW_WEIGHTS_PATH).exists() else ensure_rtmw_weights()
         )
-    extract.configure_cpu_threads(args)
     if retry_det_backend == "yolo26":
         from . import yolo_extract
 
@@ -979,8 +1261,6 @@ def reextract_failed(
         args.det_model = "yolo26x"
         args.det_weights = args.yolo_model
         yolo_extract.ensure_ready()
-        inferencer = yolo_extract.build_inferencer(args)
-        infer_video = yolo_extract.infer_video
     elif retry_det_backend == "rtmdet":
         if args.det_model != "whole_image" and str(args.det_weights) == str(RTMDET_WEIGHTS_PATH):
             args.det_weights = str(
@@ -989,8 +1269,6 @@ def reextract_failed(
                 else ensure_rtmdet_weights()
             )
         extract.ensure_openmmlab_ready()
-        inferencer = extract.build_inferencer(args)
-        infer_video = extract.infer_video
     else:
         raise ValueError("Unknown retry detector backend: {}".format(retry_det_backend))
     print(
@@ -1006,96 +1284,47 @@ def reextract_failed(
     temp_parent = Path(retry_temp_dir).expanduser() if retry_temp_dir else None
     if temp_parent is not None:
         temp_parent.mkdir(parents=True, exist_ok=True)
+
+    parallel_records = run_parallel_retry_workers(
+        retry_jobs,
+        args,
+        thresholds,
+        profile,
+        retry_det_backend,
+        retry_output,
+        replace_if_better,
+        retry_temp_dir,
+        gpu_workers=retry_gpu_workers,
+        cpu_workers=retry_cpu_workers,
+        cpu_worker_threads=retry_cpu_worker_threads,
+        cpu_pose_batch_size=retry_cpu_pose_batch_size,
+    )
+    if parallel_records is not None:
+        retry_records.extend(parallel_records)
+        return retry_records
+
+    extract.configure_cpu_threads(args)
+    inferencer, infer_video = _build_retry_runtime(args, retry_det_backend)
     with tempfile.TemporaryDirectory(
         prefix="ntu_rtmw_retry_",
         dir=str(temp_parent) if temp_parent is not None else None,
     ) as temp_name, ExitStack() as stack:
         archive_handles = {}
-        for index, (original, video, archive_source, output, relative) in enumerate(retry_jobs, 1):
-            archived = archive_source is not None
-            source_label = str(video.resolve()) if video is not None else "{}!{}".format(*archive_source)
-            record = {
-                "source_npz": original["path"],
-                "source_video": source_label,
-                "retry_npz": str(output.resolve()),
-                "profile": profile,
-                "detector": retry_det_backend,
-                "status": "error",
-            }
-            if archived:
-                record["source_archive"] = str(archive_source[0].resolve())
-                record["source_archive_member"] = archive_source[1]
-            print("retry [{}/{}] {}".format(index, len(retry_jobs), source_label), flush=True)
-            materialized_video = None
-            try:
-                if archived:
-                    materialized_video = _materialize_archive_video(
-                        archive_source,
-                        temp_name,
-                        archive_handles,
-                        stack,
-                        index,
-                    )
-                    video = materialized_video
-                output.parent.mkdir(parents=True, exist_ok=True)
-                args.expected_persons = int(original.get("expected_persons") or 1)
-                arrays = infer_video(inferencer, video, args)
-                metadata_overrides = {
-                    "retry_profile": profile,
-                    "retry_detector": retry_det_backend,
-                }
-                if retry_det_backend == "yolo26":
-                    metadata_overrides.update({
-                        "yolo_conf": args.yolo_conf,
-                        "yolo_iou": args.yolo_iou,
-                        "yolo_imgsz": args.yolo_imgsz,
-                        "crop_margin": args.crop_margin,
-                    })
-                if archived:
-                    metadata_overrides.update({
-                        "video_name": PurePosixPath(
-                            archive_source[1].replace("\\", "/")
-                        ).name,
-                        "video_path": None,
-                        "video_archive": str(archive_source[0].resolve()),
-                        "video_archive_member": archive_source[1],
-                    })
-                extract.save_npz(
-                    output,
-                    video,
-                    arrays,
-                    args,
-                    metadata_overrides=metadata_overrides,
-                )
-                retried = evaluate_npz(output, thresholds)
-                record["result"] = retried
-                record["status"] = retried["status"]
-
-                better = (
-                    retried["status"] == "pass"
-                    and (
-                        original.get("status") != "pass"
-                        or float(retried.get("quality_score", 0.0))
-                        > float(original.get("quality_score", 0.0))
-                    )
-                )
-                record["better"] = better
-                if replace_if_better and better:
-                    original_path = Path(original["path"])
-                    backup = retry_output / "original_backup" / relative
-                    backup.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(original_path, backup)
-                    shutil.copy2(output, original_path)
-                    record["replaced"] = True
-                    record["backup"] = str(backup.resolve())
-                else:
-                    record["replaced"] = False
-            except Exception as exc:
-                record["error"] = str(exc)
-            finally:
-                if materialized_video is not None:
-                    materialized_video.unlink(missing_ok=True)
-            retry_records.append(record)
+        for index, job in enumerate(retry_jobs, 1):
+            retry_records.append(_process_retry_job(
+                (index, len(retry_jobs), *job),
+                inferencer,
+                infer_video,
+                args,
+                thresholds,
+                profile,
+                retry_det_backend,
+                retry_output,
+                replace_if_better,
+                temp_name,
+                archive_handles,
+                stack,
+            ))
     return retry_records
 
 
@@ -1175,6 +1404,23 @@ def parser():
     p.add_argument("--pose-batch-size", type=int, default=1)
     p.add_argument("--cpu-threads", type=int, default=0)
     p.add_argument(
+        "--retry-gpu-workers",
+        type=int,
+        default=1,
+        help="CUDA inference processes used for failed-sample retry. Default: 1.",
+    )
+    p.add_argument(
+        "--retry-cpu-workers",
+        type=int,
+        default=None,
+        help=(
+            "Additional CPU inference processes sharing the retry queue. "
+            "Default: 1 with --repair-failed-yolo26, otherwise 0."
+        ),
+    )
+    p.add_argument("--retry-cpu-worker-threads", type=int, default=4)
+    p.add_argument("--retry-cpu-pose-batch-size", type=int, default=1)
+    p.add_argument(
         "--replace-if-better",
         action="store_true",
         help=(
@@ -1200,6 +1446,8 @@ def configure_repair_workflow(args):
         args.retry_det_backend = "yolo26"
         args.replace_if_better = True
         args.delete_failed = True
+    if args.retry_cpu_workers is None:
+        args.retry_cpu_workers = 1 if args.repair_failed_yolo26 else 0
     return args
 
 
@@ -1268,6 +1516,10 @@ def main(argv=None):
             retry_yolo_iou=args.retry_yolo_iou,
             retry_yolo_imgsz=args.retry_yolo_imgsz,
             retry_crop_margin=args.retry_crop_margin,
+            retry_gpu_workers=args.retry_gpu_workers,
+            retry_cpu_workers=args.retry_cpu_workers,
+            retry_cpu_worker_threads=args.retry_cpu_worker_threads,
+            retry_cpu_pose_batch_size=args.retry_cpu_pose_batch_size,
         )
         if retry_records:
             for result in results:

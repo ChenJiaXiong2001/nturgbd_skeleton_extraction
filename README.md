@@ -462,6 +462,9 @@ python check_skeletons.py data/skeletons_rtmw \
   --archives-dir data/raw_archives \
   --retry-temp-dir /dev/shm \
   --retry-output data/skeletons_rtmw_retry_yolo \
+  --retry-gpu-workers 1 \
+  --retry-cpu-workers 2 \
+  --retry-cpu-worker-threads 4 \
   --device cuda:0 \
   --workers 2 \
   --no-fail-exit
@@ -469,7 +472,13 @@ python check_skeletons.py data/skeletons_rtmw \
 
 This shortcut enables `--reextract-failed`, selects the YOLO26 detector,
 replaces an original when its retry passes, and deletes the selected original
-when it still fails. Replaced originals are backed up under
+when it still fails. It defaults to one CUDA retry worker plus one CPU retry
+worker on a shared dynamic queue. The example raises the CPU count to two;
+start there because every process loads its own YOLO26-X and RTMW models.
+`--workers` controls only parallel NPZ quality checks, while
+`--retry-gpu-workers` and `--retry-cpu-workers` control inference. Archive
+videos are materialized one at a time inside each worker and removed
+immediately; `/dev/shm` keeps those temporary AVIs in RAM. Replaced originals are backed up under
 `data/skeletons_rtmw_retry_yolo/original_backup`. Add `--retry-limit 100` for a
 pilot run; only those 100 selected failures can be replaced or deleted, and all
 unselected files remain untouched.

@@ -172,6 +172,17 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(args.retry_det_backend, "yolo26")
         self.assertTrue(args.replace_if_better)
         self.assertTrue(args.delete_failed)
+        self.assertEqual(args.retry_gpu_workers, 1)
+        self.assertEqual(args.retry_cpu_workers, 1)
+
+        cpu_disabled = configure_repair_workflow(
+            quality_parser().parse_args([
+                "--repair-failed-yolo26",
+                "--retry-cpu-workers",
+                "0",
+            ])
+        )
+        self.assertEqual(cpu_disabled.retry_cpu_workers, 0)
 
     def test_locates_video_inside_official_ntu_zip(self):
         with tempfile.TemporaryDirectory() as directory:
