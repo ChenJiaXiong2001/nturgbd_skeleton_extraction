@@ -249,6 +249,10 @@ def evaluate_npz(path, thresholds=None):
             comparable_body = int(common_body.sum())
             large_body_jumps = common_body & (body_jump_ratios > thresholds.large_jump_ratio)
             large_jump_rate = _safe_ratio(int(large_body_jumps.sum()), comparable_body)
+            large_body_jump_frames = [
+                int(index + 1)
+                for index in np.flatnonzero(large_body_jumps.any(axis=(1, 2)))
+            ]
             max_body_jump_ratio = (
                 float(np.max(body_jump_ratios[common_body])) if comparable_body else 0.0
             )
@@ -260,6 +264,10 @@ def evaluate_npz(path, thresholds=None):
             comparable_slots = int(common_slots.sum())
             large_slot_jumps = common_slots & (slot_jump_ratios > thresholds.slot_jump_ratio)
             slot_jump_rate = _safe_ratio(int(large_slot_jumps.sum()), comparable_slots)
+            large_slot_jump_frames = [
+                int(index + 1)
+                for index in np.flatnonzero(large_slot_jumps.any(axis=1))
+            ]
             max_slot_jump_ratio = (
                 float(np.max(slot_jump_ratios[common_slots])) if comparable_slots else 0.0
             )
@@ -284,8 +292,10 @@ def evaluate_npz(path, thresholds=None):
                 "body_complete_rate": body_complete_rate,
                 "mean_valid_body_keypoints": mean_valid_body,
                 "large_body_jump_rate": large_jump_rate,
+                "large_body_jump_frames": large_body_jump_frames,
                 "max_body_jump_ratio": max_body_jump_ratio,
                 "large_slot_jump_rate": slot_jump_rate,
+                "large_slot_jump_frames": large_slot_jump_frames,
                 "max_slot_jump_ratio": max_slot_jump_ratio,
                 "score_coordinate_mismatch_rate": mismatch_rate,
                 "invalid_active_bboxes": int(invalid_active_bboxes.sum()),
@@ -389,6 +399,59 @@ def find_npz_files(input_path):
     return sorted(path for path in input_path.rglob("*.npz") if path.is_file())
 
 
+def sample_id(result):
+    metadata = result.get("metadata", {})
+    fields = ("setup", "camera", "subject", "replication", "action")
+    try:
+        values = [int(metadata[field]) for field in fields]
+    except (KeyError, TypeError, ValueError):
+        return Path(result["path"]).stem.lower()
+    return "S{:03d}C{:03d}P{:03d}R{:03d}A{:03d}".format(*values)
+
+
+def mark_duplicate_samples(results):
+    groups = {}
+    for result in results:
+        groups.setdefault(sample_id(result), []).append(result)
+
+    for identifier, group in groups.items():
+        if len(group) < 2:
+            continue
+
+        def preference(result):
+            detector = str(result.get("metadata", {}).get("det_model", ""))
+            path = Path(result["path"])
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                modified = 0.0
+            return (
+                result.get("status") == "pass",
+                detector not in {"", "whole_image"},
+                float(result.get("quality_score", 0.0)),
+                len(path.parts),
+                modified,
+            )
+
+        preferred = max(group, key=preference)
+        paths = [result["path"] for result in group]
+        for result in group:
+            result.setdefault("metrics", {})["duplicate_sample_id"] = identifier
+            result["metrics"]["duplicate_paths"] = paths
+            if result is preferred:
+                result.setdefault("warnings", []).append(
+                    "duplicate_sample_id={} preferred_copy".format(identifier)
+                )
+                continue
+            result.setdefault("reasons", []).append(
+                "duplicate_sample_id={} preferred={}".format(identifier, preferred["path"])
+            )
+            if result.get("status") == "pass":
+                result["status"] = "fail"
+            result["quality_score"] = min(float(result.get("quality_score", 0.0)), 85.0)
+    return results
+
+
 def scan_skeletons(input_path, thresholds=None, workers=4):
     thresholds = thresholds or QualityThresholds()
     paths = find_npz_files(input_path)
@@ -396,7 +459,7 @@ def scan_skeletons(input_path, thresholds=None, workers=4):
         return []
     workers = min(max(1, int(workers or 1)), len(paths))
     if workers == 1:
-        return [evaluate_npz(path, thresholds) for path in paths]
+        return mark_duplicate_samples([evaluate_npz(path, thresholds) for path in paths])
 
     indexed_results = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -419,7 +482,7 @@ def scan_skeletons(input_path, thresholds=None, workers=4):
                     "reasons": ["worker_error: {}".format(exc)],
                     "warnings": [],
                 }
-    return [indexed_results[index] for index in range(len(paths))]
+    return mark_duplicate_samples([indexed_results[index] for index in range(len(paths))])
 
 
 def report_summary(results):
@@ -577,6 +640,17 @@ def reextract_failed(
     retry_jobs = []
     retry_records = []
     for result in failed:
+        duplicate_reason = next(
+            (reason for reason in result.get("reasons", []) if reason.startswith("duplicate_sample_id=")),
+            None,
+        )
+        if duplicate_reason:
+            retry_records.append({
+                "source_npz": result["path"],
+                "status": "skipped_duplicate_copy",
+                "reason": duplicate_reason,
+            })
+            continue
         video = locate_source_video(result, skeleton_root, video_root, video_index)
         relative = _retry_relative_path(result, skeleton_root)
         output = retry_output / relative

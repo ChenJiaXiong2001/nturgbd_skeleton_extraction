@@ -5,7 +5,13 @@ from pathlib import Path
 
 import numpy as np
 
-from ntu_rtmw.quality import QualityThresholds, evaluate_npz, parse_integer_spec
+from ntu_rtmw.quality import (
+    QualityThresholds,
+    evaluate_npz,
+    parse_integer_spec,
+    reextract_failed,
+    scan_skeletons,
+)
 
 
 def write_skeleton(path, action, frames=20, persons=2, missing_second=None):
@@ -72,6 +78,39 @@ class QualityTests(unittest.TestCase):
             self.assertEqual(result["metrics"]["longest_missing_run"], 12)
             self.assertTrue(any("expected_person_recall" in reason for reason in result["reasons"]))
             self.assertTrue(any("longest_missing_run" in reason for reason in result["reasons"]))
+
+    def test_duplicate_sample_marks_only_extra_copy_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "nested" / "S001C001P001R001A001_rgb.npz"
+            second = root / "S001C001P001R001A001_rgb.npz"
+            first.parent.mkdir(parents=True)
+            write_skeleton(first, action=1, persons=2, missing_second=(0, 20))
+            write_skeleton(second, action=1, persons=2, missing_second=(0, 20))
+            results = scan_skeletons(root, workers=1)
+            self.assertEqual(sum(result["status"] == "pass" for result in results), 1)
+            self.assertEqual(sum(result["status"] == "fail" for result in results), 1)
+            failed = next(result for result in results if result["status"] == "fail")
+            self.assertTrue(any("duplicate_sample_id" in reason for reason in failed["reasons"]))
+
+    def test_retry_skips_duplicate_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = {
+                "path": str(root / "duplicate.npz"),
+                "status": "fail",
+                "quality_score": 85.0,
+                "metadata": {},
+                "reasons": ["duplicate_sample_id=test preferred=preferred.npz"],
+            }
+            records = reextract_failed(
+                [result],
+                QualityThresholds(),
+                root,
+                root,
+                root / "retry",
+            )
+            self.assertEqual(records[0]["status"], "skipped_duplicate_copy")
 
 
 if __name__ == "__main__":

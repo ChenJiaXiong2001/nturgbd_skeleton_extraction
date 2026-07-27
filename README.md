@@ -354,9 +354,11 @@ py -3.10 check_skeletons.py data\skeletons_rtmw
 The default rules expect one person for ordinary actions and two people for
 NTU actions A050-A060. The checker validates the array structure, continuous
 frame indices, expected-person recall, longest missing-person run, valid body
-keypoints, and normalized frame-to-frame body/slot jumps. A failed scan exits
-with status code 1 so it can stop a training pipeline. Add `--no-fail-exit`
-when only a report is needed.
+keypoints, normalized frame-to-frame body/slot jumps, and duplicate NTU sample
+IDs. When duplicates exist, the passing RTMDet result with the highest quality
+score is preferred and the extra copies fail the check. A failed scan exits
+with status code 1 so it can stop a training pipeline. Add `--no-fail-exit` when
+only a report is needed.
 
 Useful threshold overrides:
 
