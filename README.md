@@ -423,6 +423,29 @@ python check_skeletons.py \
 Archive fallback is enabled by default. Use `--no-retry-from-archives` to
 require already expanded videos under `data/extracted`.
 
+For close two-person actions where RTMDet-tiny still misses the second person,
+retry the same failed samples with YOLO26-X person boxes and RTMW-L pose crops.
+Use a separate output directory so the RTMDet pilot remains available:
+
+```bash
+python check_skeletons.py \
+  --reextract-failed \
+  --retry-det-backend yolo26 \
+  --retry-yolo-model models/yolo26x.pt \
+  --retry-yolo-conf 0.15 \
+  --retry-yolo-iou 0.70 \
+  --retry-yolo-imgsz 960 \
+  --retry-crop-margin 0.10 \
+  --retry-output data/skeletons_rtmw_retry_yolo \
+  --retry-temp-dir /dev/shm \
+  --retry-limit 100 \
+  --retry-profile relaxed \
+  --device cuda:0
+```
+
+YOLO26-X changes only person detection. RTMW-L remains the pose model, and the
+same quality thresholds decide whether a retry passes.
+
 The equivalent command with explicit Windows paths is:
 
 ```powershell

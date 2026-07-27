@@ -622,6 +622,7 @@ def save_npz(path, video, arrays, args, metadata_overrides=None):
         "pose_model": args.pose2d,
         "pose_weights": args.pose2d_weights,
         "det_model": args.det_model,
+        "det_weights": getattr(args, "det_weights", None),
         "keypoint_convention": "coco_wholebody_133",
         "max_persons": args.max_persons,
     })

@@ -202,6 +202,66 @@ class QualityTests(unittest.TestCase):
             self.assertEqual(metadata["video_archive_member"], member)
             self.assertEqual(list(retry_temp.iterdir()), [])
 
+    def test_retry_can_route_zip_video_through_yolo26_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skeleton_root = root / "skeletons"
+            skeleton_root.mkdir()
+            original = skeleton_root / "S001C001P001R001A055_rgb.npz"
+            write_skeleton(original, action=55, missing_second=(5, 17))
+            result = evaluate_npz(original)
+
+            passing = root / "passing.npz"
+            write_skeleton(passing, action=55)
+            with np.load(passing, allow_pickle=False) as data:
+                arrays = {
+                    key: data[key]
+                    for key in ("keypoints", "scores", "bboxes", "bbox_scores", "frame_indices")
+                }
+
+            archives = root / "raw_archives"
+            archives.mkdir()
+            archive = archives / "nturgbd_rgb_s001.zip"
+            member = "nturgb+d_rgb/S001C001P001R001A055_rgb.avi"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr(member, b"video-bytes")
+            yolo_model = root / "yolo26x.pt"
+            yolo_model.write_bytes(b"weights")
+
+            retry_output = root / "retry_yolo"
+            with (
+                patch("ntu_rtmw.extract.ensure_supported_python"),
+                patch("ntu_rtmw.extract.configure_cpu_threads"),
+                patch("ntu_rtmw.yolo_extract.ensure_ready"),
+                patch("ntu_rtmw.yolo_extract.build_inferencer", return_value=object()) as build_yolo,
+                patch("ntu_rtmw.yolo_extract.infer_video", return_value=arrays) as infer_yolo,
+            ):
+                records = reextract_failed(
+                    [result],
+                    QualityThresholds(),
+                    skeleton_root,
+                    root / "extracted",
+                    retry_output,
+                    device="cpu",
+                    archives_dir=archives,
+                    retry_det_backend="yolo26",
+                    retry_yolo_model=yolo_model,
+                    retry_yolo_conf=0.15,
+                    retry_yolo_iou=0.70,
+                    retry_yolo_imgsz=960,
+                    retry_crop_margin=0.10,
+                )
+
+            self.assertEqual(records[0]["status"], "pass", records[0])
+            self.assertEqual(records[0]["detector"], "yolo26")
+            build_yolo.assert_called_once()
+            infer_yolo.assert_called_once()
+            retried = retry_output / original.name
+            with np.load(retried, allow_pickle=False) as data:
+                metadata = json.loads(data["metadata"].item())
+            self.assertEqual(metadata["det_model"], "yolo26x")
+            self.assertEqual(metadata["det_weights"], str(yolo_model))
+
 
 if __name__ == "__main__":
     unittest.main()

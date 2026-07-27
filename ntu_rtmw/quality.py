@@ -12,7 +12,14 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
-from .constants import DATA_DIR, EXTRACTED_DIR, RAW_ARCHIVES_DIR, SKELETON_DIR, VIDEO_EXTENSIONS
+from .constants import (
+    DATA_DIR,
+    EXTRACTED_DIR,
+    RAW_ARCHIVES_DIR,
+    SKELETON_DIR,
+    VIDEO_EXTENSIONS,
+    YOLO_WEIGHTS_PATH,
+)
 from .manifest import meta_from_path
 
 
@@ -768,6 +775,13 @@ def reextract_failed(
     archives_dir=None,
     retry_from_archives=True,
     retry_temp_dir=None,
+    retry_det_backend="rtmdet",
+    retry_bbox_thr=None,
+    retry_yolo_model=None,
+    retry_yolo_conf=0.15,
+    retry_yolo_iou=0.70,
+    retry_yolo_imgsz=960,
+    retry_crop_margin=0.10,
 ):
     failed = [result for result in results if result["status"] != "pass"]
     if retry_limit is not None:
@@ -819,12 +833,11 @@ def reextract_failed(
         return retry_records
 
     from . import extract
-    from .constants import RTMDET_WEIGHTS_PATH, RTMW_WEIGHTS_PATH
+    from .constants import RTMDET_WEIGHTS_PATH, RTMW_WEIGHTS_PATH, YOLO_WEIGHTS_PATH
     from .device import resolve_device
     from .download import ensure_rtmdet_weights, ensure_rtmw_weights
 
     extract.ensure_supported_python()
-    extract.ensure_openmmlab_ready()
     parser = extract.parser()
     args = parser.parse_args([
         "--input", str(video_root),
@@ -839,6 +852,8 @@ def reextract_failed(
     args.show_skeleton = False
     args.visualize_dir = None
     args.skip_existing = False
+    if retry_bbox_thr is not None:
+        args.bbox_thr = float(retry_bbox_thr)
     if profile == "relaxed":
         args.output_bbox_margin = 0.10
         args.temporal_min_frames = 1
@@ -851,14 +866,43 @@ def reextract_failed(
         args.pose2d_weights = str(
             RTMW_WEIGHTS_PATH if Path(RTMW_WEIGHTS_PATH).exists() else ensure_rtmw_weights()
         )
-    if args.det_model != "whole_image" and str(args.det_weights) == str(RTMDET_WEIGHTS_PATH):
-        args.det_weights = str(
-            RTMDET_WEIGHTS_PATH if Path(RTMDET_WEIGHTS_PATH).exists() else ensure_rtmdet_weights()
-        )
-
     extract.configure_cpu_threads(args)
-    print("retry device {} profile {}".format(args.device, profile), flush=True)
-    inferencer = extract.build_inferencer(args)
+    if retry_det_backend == "yolo26":
+        from . import yolo_extract
+
+        args.yolo_model = str(retry_yolo_model or YOLO_WEIGHTS_PATH)
+        args.yolo_conf = float(retry_yolo_conf)
+        args.yolo_iou = float(retry_yolo_iou)
+        args.yolo_imgsz = int(retry_yolo_imgsz)
+        args.crop_margin = float(retry_crop_margin)
+        if retry_bbox_thr is None:
+            args.bbox_thr = args.yolo_conf
+        args.det_model = "yolo26x"
+        args.det_weights = args.yolo_model
+        yolo_extract.ensure_ready()
+        inferencer = yolo_extract.build_inferencer(args)
+        infer_video = yolo_extract.infer_video
+    elif retry_det_backend == "rtmdet":
+        if args.det_model != "whole_image" and str(args.det_weights) == str(RTMDET_WEIGHTS_PATH):
+            args.det_weights = str(
+                RTMDET_WEIGHTS_PATH
+                if Path(RTMDET_WEIGHTS_PATH).exists()
+                else ensure_rtmdet_weights()
+            )
+        extract.ensure_openmmlab_ready()
+        inferencer = extract.build_inferencer(args)
+        infer_video = extract.infer_video
+    else:
+        raise ValueError("Unknown retry detector backend: {}".format(retry_det_backend))
+    print(
+        "retry device {} profile {} detector {} bbox_thr {:.3f}".format(
+            args.device,
+            profile,
+            retry_det_backend,
+            args.bbox_thr,
+        ),
+        flush=True,
+    )
 
     temp_parent = Path(retry_temp_dir).expanduser() if retry_temp_dir else None
     if temp_parent is not None:
@@ -876,6 +920,7 @@ def reextract_failed(
                 "source_video": source_label,
                 "retry_npz": str(output.resolve()),
                 "profile": profile,
+                "detector": retry_det_backend,
                 "status": "error",
             }
             if archived:
@@ -894,17 +939,27 @@ def reextract_failed(
                     )
                     video = materialized_video
                 output.parent.mkdir(parents=True, exist_ok=True)
-                arrays = extract.infer_video(inferencer, video, args)
-                metadata_overrides = None
+                arrays = infer_video(inferencer, video, args)
+                metadata_overrides = {
+                    "retry_profile": profile,
+                    "retry_detector": retry_det_backend,
+                }
+                if retry_det_backend == "yolo26":
+                    metadata_overrides.update({
+                        "yolo_conf": args.yolo_conf,
+                        "yolo_iou": args.yolo_iou,
+                        "yolo_imgsz": args.yolo_imgsz,
+                        "crop_margin": args.crop_margin,
+                    })
                 if archived:
-                    metadata_overrides = {
+                    metadata_overrides.update({
                         "video_name": PurePosixPath(
                             archive_source[1].replace("\\", "/")
                         ).name,
                         "video_path": None,
                         "video_archive": str(archive_source[0].resolve()),
                         "video_archive_member": archive_source[1],
-                    }
+                    })
                 extract.save_npz(
                     output,
                     video,
@@ -987,6 +1042,22 @@ def parser():
     p.add_argument("--retry-output", default=str(DATA_DIR / "skeletons_rtmw_retry"))
     p.add_argument("--retry-profile", choices=["standard", "relaxed"], default="relaxed")
     p.add_argument("--retry-limit", type=int)
+    p.add_argument(
+        "--retry-det-backend",
+        choices=["rtmdet", "yolo26"],
+        default="rtmdet",
+        help="Person detector used only for failed-sample re-extraction.",
+    )
+    p.add_argument(
+        "--retry-bbox-thr",
+        type=float,
+        help="Retry person score threshold. Defaults to 0.3 for RTMDet and YOLO confidence for YOLO26.",
+    )
+    p.add_argument("--retry-yolo-model", default=str(YOLO_WEIGHTS_PATH))
+    p.add_argument("--retry-yolo-conf", type=float, default=0.15)
+    p.add_argument("--retry-yolo-iou", type=float, default=0.70)
+    p.add_argument("--retry-yolo-imgsz", type=int, default=960)
+    p.add_argument("--retry-crop-margin", type=float, default=0.10)
     p.add_argument("--device", default="auto")
     p.add_argument("--pose-batch-size", type=int, default=1)
     p.add_argument("--cpu-threads", type=int, default=0)
@@ -1055,6 +1126,13 @@ def main(argv=None):
             archives_dir=archives_dir,
             retry_from_archives=args.retry_from_archives,
             retry_temp_dir=args.retry_temp_dir,
+            retry_det_backend=args.retry_det_backend,
+            retry_bbox_thr=args.retry_bbox_thr,
+            retry_yolo_model=args.retry_yolo_model,
+            retry_yolo_conf=args.retry_yolo_conf,
+            retry_yolo_iou=args.retry_yolo_iou,
+            retry_yolo_imgsz=args.retry_yolo_imgsz,
+            retry_crop_margin=args.retry_crop_margin,
         )
         if retry_records:
             for result in results:

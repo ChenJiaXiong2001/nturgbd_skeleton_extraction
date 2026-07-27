@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import json
 import time
 from argparse import Namespace
@@ -24,8 +25,8 @@ from .extract import draw_skeleton, require_numpy, select_instances
 VARIANTS = [
     ("rtmdet_frame", "RTMDet frame"),
     ("rtmdet_crop", "RTMDet crop"),
-    ("yolo_frame", "YOLO frame"),
-    ("yolo_crop", "YOLO crop"),
+    ("yolo_frame", "YOLO26-X frame"),
+    ("yolo_crop", "YOLO26-X crop"),
 ]
 
 
@@ -300,12 +301,60 @@ def summarize(outputs, kpt_thr):
     }
 
 
+def match_people_by_bbox(reference, candidate):
+    """Return person index pairs that maximize total bbox IoU."""
+    import numpy as np
+
+    reference_indices = [
+        idx for idx, (bbox, score) in enumerate(zip(reference["bboxes"], reference["bbox_scores"]))
+        if score > 0 and np.isfinite(bbox).all()
+    ]
+    candidate_indices = [
+        idx for idx, (bbox, score) in enumerate(zip(candidate["bboxes"], candidate["bbox_scores"]))
+        if score > 0 and np.isfinite(bbox).all()
+    ]
+    pair_count = min(len(reference_indices), len(candidate_indices))
+    if pair_count == 0:
+        return []
+
+    if len(reference_indices) <= len(candidate_indices):
+        candidates = (
+            list(zip(reference_indices, permutation))
+            for permutation in itertools.permutations(candidate_indices, pair_count)
+        )
+    else:
+        candidates = (
+            list(zip(permutation, candidate_indices))
+            for permutation in itertools.permutations(reference_indices, pair_count)
+        )
+
+    best_pairs = []
+    best_score = -1.0
+    for pairs in candidates:
+        score = sum(
+            bbox_iou(reference["bboxes"][ref_idx], candidate["bboxes"][candidate_idx]) or 0.0
+            for ref_idx, candidate_idx in pairs
+        )
+        if score > best_score:
+            best_pairs = pairs
+            best_score = score
+    return best_pairs
+
+
 def compare_outputs(reference, candidate, kpt_thr):
     import numpy as np
 
     ious = []
     dists = []
     common_counts = []
+    matched_ious = []
+    matched_dists = []
+    matched_body_dists = []
+    matched_normalized_dists = []
+    matched_common_counts = []
+    matched_person_counts = []
+    comparable_order_frames = 0
+    swapped_order_frames = 0
     for (_, a), (_, b) in zip(reference, candidate):
         ious.append(bbox_iou(a["bboxes"][0], b["bboxes"][0]))
         pa = a["keypoints"][0]
@@ -316,10 +365,58 @@ def compare_outputs(reference, candidate, kpt_thr):
         common_counts.append(int(valid.sum()))
         if valid.any():
             dists.append(float(np.linalg.norm(pa[valid] - pb[valid], axis=1).mean()))
+
+        pairs = match_people_by_bbox(a, b)
+        matched_person_counts.append(len(pairs))
+        if len(pairs) >= 2:
+            comparable_order_frames += 1
+            if any(ref_idx != candidate_idx for ref_idx, candidate_idx in pairs):
+                swapped_order_frames += 1
+        for ref_idx, candidate_idx in pairs:
+            ref_bbox = a["bboxes"][ref_idx]
+            candidate_bbox = b["bboxes"][candidate_idx]
+            matched_ious.append(bbox_iou(ref_bbox, candidate_bbox))
+            ref_points = a["keypoints"][ref_idx]
+            candidate_points = b["keypoints"][candidate_idx]
+            ref_scores = a["scores"][ref_idx]
+            candidate_scores = b["scores"][candidate_idx]
+            matched_valid = (
+                (ref_scores >= kpt_thr)
+                & (candidate_scores >= kpt_thr)
+                & np.isfinite(ref_points).all(axis=1)
+                & np.isfinite(candidate_points).all(axis=1)
+            )
+            matched_common_counts.append(int(matched_valid.sum()))
+            if not matched_valid.any():
+                continue
+            point_distances = np.linalg.norm(
+                ref_points[matched_valid] - candidate_points[matched_valid], axis=1
+            )
+            mean_distance = float(point_distances.mean())
+            matched_dists.append(mean_distance)
+            body_valid = matched_valid[:17]
+            if body_valid.any():
+                matched_body_dists.append(float(np.linalg.norm(
+                    ref_points[:17][body_valid] - candidate_points[:17][body_valid], axis=1
+                ).mean()))
+            bbox_diagonal = float(np.linalg.norm(ref_bbox[2:4] - ref_bbox[:2]))
+            if bbox_diagonal > 0:
+                matched_normalized_dists.append(mean_distance / bbox_diagonal)
     return {
         "avg_bbox_iou_person0": mean(ious),
         "avg_common_keypoints_person0": mean(common_counts),
         "avg_keypoint_l2_px_person0": mean(dists),
+        "avg_matched_persons_per_frame": mean(matched_person_counts),
+        "avg_matched_bbox_iou": mean(matched_ious),
+        "avg_matched_common_keypoints": mean(matched_common_counts),
+        "avg_matched_keypoint_l2_px": mean(matched_dists),
+        "avg_matched_body_keypoint_l2_px": mean(matched_body_dists),
+        "avg_matched_keypoint_l2_bbox_diag_ratio": mean(matched_normalized_dists),
+        "frames_with_comparable_person_order": comparable_order_frames,
+        "frames_with_swapped_person_order": swapped_order_frames,
+        "person_order_swap_rate": (
+            swapped_order_frames / comparable_order_frames if comparable_order_frames else None
+        ),
     }
 
 
@@ -442,6 +539,11 @@ def main():
         "frames": len(frames),
         "stride": args.stride,
         "reference": reference,
+        "models": {
+            "pose": str(RTMW_WEIGHTS_PATH),
+            "rtmdet": str(RTMDET_WEIGHTS_PATH),
+            "yolo": str(YOLO_WEIGHTS_PATH),
+        },
         "variants": {
             name: summarize(outputs, args.kpt_thr)
             for name, outputs in outputs_by_variant.items()
