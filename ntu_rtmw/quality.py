@@ -18,7 +18,7 @@ BODY_KEYPOINTS = 17
 
 @dataclass(frozen=True)
 class QualityThresholds:
-    two_person_actions: tuple = tuple(range(50, 61))
+    two_person_actions: tuple = tuple(range(50, 61)) + tuple(range(106, 121))
     default_expected_persons: int = 1
     keypoint_score_threshold: float = 0.1
     presence_body_keypoints: int = 5
@@ -807,7 +807,7 @@ def parser():
     p.add_argument("--report-dir", default=str(DATA_DIR / "quality_reports"))
     p.add_argument("--report-prefix", default="skeleton_quality")
     p.add_argument("--workers", type=int, default=4, help="Parallel workers used only for .npz checks.")
-    p.add_argument("--two-person-actions", default="50-60")
+    p.add_argument("--two-person-actions", default="50-60,106-120")
     p.add_argument("--default-expected-persons", type=int, default=1)
     p.add_argument("--kpt-thr", type=float, default=0.1)
     p.add_argument("--presence-body-keypoints", type=int, default=5)

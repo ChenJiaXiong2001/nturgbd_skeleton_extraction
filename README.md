@@ -374,7 +374,7 @@ py -3.10 check_skeletons.py data\skeletons_rtmw
 ```
 
 The default rules expect one person for ordinary actions and two people for
-NTU actions A050-A060. The checker validates the array structure, continuous
+NTU interaction actions A050-A060 and A106-A120. The checker validates the array structure, continuous
 frame indices, expected-person recall, longest missing-person run, valid body
 keypoints, normalized frame-to-frame body/slot jumps, and duplicate NTU sample
 IDs. When duplicates exist, the passing RTMDet result with the highest quality
@@ -391,8 +391,8 @@ py -3.10 check_skeletons.py data\skeletons_rtmw `
   --max-large-jump-rate 0.02
 ```
 
-Additional NTU120 two-person labels can be supplied as ranges or individual
-actions, for example `--two-person-actions 50-60,106-110`.
+Custom two-person labels can be supplied as ranges or individual actions, for
+example `--two-person-actions 50-60,106-120`.
 
 Failed files can be re-extracted from their source videos into a separate
 directory. With the standard project layout, only the action flags are needed:

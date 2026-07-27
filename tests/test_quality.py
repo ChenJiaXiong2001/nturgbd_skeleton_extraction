@@ -69,6 +69,14 @@ class QualityTests(unittest.TestCase):
             self.assertEqual(result["status"], "pass", result["reasons"])
             self.assertEqual(result["metrics"]["expected_person_recall"], 1.0)
 
+    def test_ntu120_interaction_expects_two_people(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "S001C001P001R001A119_rgb.npz"
+            write_skeleton(path, action=119, persons=2, missing_second=(5, 17))
+            result = evaluate_npz(path)
+            self.assertEqual(result["expected_persons"], 2)
+            self.assertEqual(result["status"], "fail")
+
     def test_long_second_person_dropout_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "S001C001P001R001A055_rgb.npz"
